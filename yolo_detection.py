@@ -1,8 +1,19 @@
 from ultralytics import YOLO
 import cv2
+import pyttsx3
+import threading
+
+def speak(text):
+    engine = pyttsx3.init()
+    engine.setProperty('rate', 150)
+    engine.say(text)
+    engine.runAndWait()
 
 # Load YOLO model
 model = YOLO("yolov8n.pt")
+
+last_spoken = ""
+cooldown = 0
 
 # Open webcam
 cap = cv2.VideoCapture(0)
@@ -59,17 +70,24 @@ while True:
             direction = data["direction"]
             distance = data["distance"]
 
-            if label == "person":
-                danger = "human"
-            elif label in ["car", "motorcycle", "bicycle"]:
-                danger = "vehicle"
-            else:
-                danger = "obstacle"
-
             print(f"{distance} obstacle {direction} ({label})")
 
-            if distance in ["VERY CLOSE", "CLOSE"] and direction == "CENTER":
-                print("⚠️ Obstacle ahead!")
+            message = ""
+            if distance in ["VERY CLOSE", "CLOSE"]:
+                if direction == "CENTER":
+                    message = f"{label} ahead"
+                elif direction == "LEFT":
+                    message = f"{label} on your left"
+                elif direction == "RIGHT":
+                    message = f"{label} on your right"
+
+            if message and (message != last_spoken or cooldown > 10):
+                print(message)
+                threading.Thread(target=speak, args=(message,), daemon=True).start()
+                last_spoken = message
+                cooldown = 0
+            else:
+                cooldown += 1
 
     cv2.imshow("YOLO Detection", frame)
 
