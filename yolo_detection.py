@@ -3,11 +3,30 @@ import cv2
 import pyttsx3
 import threading
 
+engine = pyttsx3.init()
+engine.setProperty('rate', 180)
+
+is_speaking = False
+
 def speak(text):
-    engine = pyttsx3.init()
-    engine.setProperty('rate', 150)
-    engine.say(text)
-    engine.runAndWait()
+    global is_speaking
+    if is_speaking:
+        return
+    def run():
+        global is_speaking
+        is_speaking = True
+        engine.say(text)
+        engine.runAndWait()
+        is_speaking = False
+    threading.Thread(target=run, daemon=True).start()
+
+def vibrate(level):
+    if level == "VERY CLOSE":
+        print("📳📳📳 STRONG VIBRATION")
+    elif level == "CLOSE":
+        print("📳📳 MEDIUM VIBRATION")
+    elif level == "MEDIUM":
+        print("📳 LIGHT VIBRATION")
 
 # Load YOLO model
 model = YOLO("yolov8n.pt")
@@ -72,6 +91,8 @@ while True:
 
             print(f"{distance} obstacle {direction} ({label})")
 
+            vibrate(distance)
+
             message = ""
             if distance in ["VERY CLOSE", "CLOSE"]:
                 if direction == "CENTER":
@@ -83,7 +104,7 @@ while True:
 
             if message and (message != last_spoken or cooldown > 10):
                 print(message)
-                threading.Thread(target=speak, args=(message,), daemon=True).start()
+                speak(message)
                 last_spoken = message
                 cooldown = 0
             else:
