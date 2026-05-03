@@ -31,7 +31,7 @@ def vibrate(level):
 
 model = YOLO("yolov8n.pt")  # Switch to yolov8n.onnx after training
 
-road_obstacles = ["person", "car", "bicycle", "motorcycle", "chair", "stairs"]
+road_obstacles = ["person", "bed", "door", "sofa", "stair", "table", "toilet"]
 
 last_spoken = ""
 last_spoken_time = 0
@@ -94,7 +94,7 @@ while cap.isOpened():
             if distance not in ["VERY CLOSE", "CLOSE"]:
                 continue
 
-            if label == "stairs":
+            if label == "stair":
                 message = f"Warning! Stairs {direction}"
             else:
                 message = f"{label} {direction}"
