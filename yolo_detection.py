@@ -29,7 +29,7 @@ def vibrate(level):
     elif level == "MEDIUM":
         print("📳 LIGHT VIBRATION")
 
-model = YOLO("yolov8n.pt")  # Switch to yolov8n.onnx after training
+model = YOLO("yolov8n.onnx")
 
 road_obstacles = ["person", "bed", "door", "sofa", "stair", "table", "toilet"]
 
