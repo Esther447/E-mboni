@@ -1,11 +1,14 @@
 import shutil
 import os
+import glob
 
-src = os.path.join("runs", "detect", "train", "weights", "best.onnx")
-dst = "yolov8n.onnx"
+# Find the latest training run
+runs = sorted(glob.glob(os.path.join("runs", "detect", "train*", "weights", "best.onnx")))
 
-if os.path.exists(src):
-    shutil.copy(src, dst)
-    print(f"SUCCESS: Model copied to {dst} — ready to run yolo_detection.py")
+if not runs:
+    print("ERROR: No best.onnx found. Make sure training completed and ONNX was exported.")
 else:
-    print("ERROR: Training not complete yet. Run python train_model.py first.")
+    src = runs[-1]  # Use the latest run
+    dst = "yolov8n.onnx"
+    shutil.copy(src, dst)
+    print(f"SUCCESS: Model copied from {src} to {dst} — ready to run yolo_detection.py")
