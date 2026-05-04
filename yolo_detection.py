@@ -36,16 +36,26 @@ DANGER_OBJECTS = [
     "traffic cone", "stop sign", "traffic light",
 ]
 
-WARNING_OBJECTS = [
-    # Indoor navigation
-    "door", "bed", "toilet", "sofa", "table", "chair",
-    # Daily utility
-    "bottle", "cup", "laptop", "cell phone",
-    # Surface dangers (detectable via general model)
+NAVIGATION_OBJECTS = [
+    # Entry/exit points
+    "door",
+    # Large furniture
+    "sofa", "bed", "dining table", "chair",
+    # Path clearance
+    "potted plant",
+    # Appliance locators
+    "refrigerator", "microwave", "oven", "sink", "toilet",
+]
+
+UTILITY_OBJECTS = [
+    # Daily utility & social interaction
+    "bottle", "cup", "laptop", "cell phone", "keyboard", "mouse",
+    "book", "clock", "vase", "remote", "handbag", "backpack",
+    # Surface dangers
     "fire hydrant", "parking meter",
 ]
 
-eye_of_blind_list = DANGER_OBJECTS + WARNING_OBJECTS
+eye_of_blind_list = DANGER_OBJECTS + NAVIGATION_OBJECTS + UTILITY_OBJECTS
 
 cap = cv2.VideoCapture(0)
 last_spoken_time = 0
@@ -83,28 +93,41 @@ while cap.isOpened():
             elif norm_x < 0.67: pos = "straight ahead"
             else: pos = "on your right"
 
-            # Priority: DANGER objects always override
-            priority = "HIGH" if label in DANGER_OBJECTS and zone == "DANGER" else "NORMAL"
+            # Priority assignment
+            if label in DANGER_OBJECTS and zone == "DANGER":
+                priority = "HIGH"
+            elif label in NAVIGATION_OBJECTS and zone in ["DANGER", "WARNING"]:
+                priority = "MEDIUM"
+            elif label in UTILITY_OBJECTS and zone in ["DANGER", "WARNING"]:
+                priority = "LOW"
+            else:
+                priority = "NONE"
 
-            if label not in detected_objects:
+            if label not in detected_objects and priority != "NONE":
                 detected_objects[label] = {"pos": pos, "zone": zone, "priority": priority}
             
             # Print vibration feedback
             if zone == "DANGER": print(f"📳📳📳 STRONG | {label} {pos}")
             elif zone == "WARNING": print(f"📳📳 MEDIUM | {label} {pos}")
 
-    # Speak findings — HIGH priority bypasses cooldown
+    # Speak findings by priority tier
     now = time.time()
-    high_priority = [d for d in detected_objects.values() if d["priority"] == "HIGH"]
-    normal = [d for d in detected_objects.values() if d["priority"] == "NORMAL" and d["zone"] != "SAFE"]
+    high   = {l: d for l, d in detected_objects.items() if d["priority"] == "HIGH"}
+    medium = {l: d for l, d in detected_objects.items() if d["priority"] == "MEDIUM"}
+    low    = {l: d for l, d in detected_objects.items() if d["priority"] == "LOW"}
 
-    if high_priority:
-        msg = "STOP. " + ", ".join(f"{l} {d['pos']}" for l, d in detected_objects.items() if d["priority"] == "HIGH")
+    if high:
+        msg = "STOP. " + ", ".join(f"{l} {d['pos']}" for l, d in high.items())
         speak(msg)
         last_spoken_time = now
-    elif normal and (now - last_spoken_time) > 3:
-        msg = ", ".join(f"{l} {d['pos']}" for l, d in detected_objects.items() if d["priority"] == "NORMAL" and d["zone"] != "SAFE")
-        print(f"AI Voice: {msg}")
+    elif medium and (now - last_spoken_time) > 3:
+        msg = ", ".join(f"{l} {d['pos']}" for l, d in medium.items())
+        print(f"AI Voice [NAV]: {msg}")
+        speak(msg)
+        last_spoken_time = now
+    elif low and (now - last_spoken_time) > 5:
+        msg = ", ".join(f"{l} {d['pos']}" for l, d in low.items())
+        print(f"AI Voice [UTIL]: {msg}")
         speak(msg)
         last_spoken_time = now
 
