@@ -48,9 +48,14 @@ NAVIGATION_OBJECTS = [
 ]
 
 UTILITY_OBJECTS = [
-    # Daily utility & social interaction
-    "bottle", "cup", "laptop", "cell phone", "keyboard", "mouse",
-    "book", "clock", "vase", "remote", "handbag", "backpack",
+    # Personal tech
+    "laptop", "cell phone", "keyboard", "mouse", "remote",
+    # Kitchen/dining
+    "bottle", "cup", "bowl", "spoon", "fork", "knife",
+    # Common items
+    "backpack", "suitcase", "umbrella", "book", "handbag",
+    # Animals (Rwanda environment)
+    "dog", "cow", "bird", "cat", "horse",
     # Surface dangers
     "fire hydrant", "parking meter",
 ]
