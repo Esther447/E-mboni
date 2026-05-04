@@ -4,15 +4,14 @@ import pyttsx3
 import threading
 import time
 
+# --- INITIALIZE VOICE ---
 engine = pyttsx3.init()
 engine.setProperty('rate', 180)
-
 is_speaking = False
 
 def speak(text):
     global is_speaking
-    if is_speaking:
-        return
+    if is_speaking: return
     def run():
         global is_speaking
         is_speaking = True
@@ -21,26 +20,35 @@ def speak(text):
         is_speaking = False
     threading.Thread(target=run, daemon=True).start()
 
-def vibrate(zone):
-    if zone == "DANGER":
-        print("📳📳📳 STRONG VIBRATION")
-    elif zone == "WARNING":
-        print("📳📳 MEDIUM VIBRATION")
+# --- LOAD BOTH MODELS ---
+# Custom: Stairs, Doors, etc.
+custom_model = YOLO("yolov8n.onnx") 
+# General: People, Bottles, Cups, Laptops, etc.
+general_model = YOLO("yolov8n.pt") 
 
-custom_model = YOLO("yolov8n.onnx")
-general_model = YOLO("yolov8n.pt")
-
-eye_of_blind_list = [
-    "person", "car", "bicycle", "stop sign", "traffic light",
-    "cell phone", "laptop", "bottle", "cup", "chair",
-    "door", "stair", "bed", "toilet", "sofa", "table"
+# Priority tiers for alert logic
+DANGER_OBJECTS = [
+    # Dynamic obstacles
+    "person", "bicycle", "car", "bus", "truck", "motorcycle",
+    # Drop-offs & elevation
+    "stair",
+    # Street hazards
+    "traffic cone", "stop sign", "traffic light",
 ]
 
-last_spoken = ""
-last_spoken_time = 0
-COOLDOWN_SECONDS = 3
+WARNING_OBJECTS = [
+    # Indoor navigation
+    "door", "bed", "toilet", "sofa", "table", "chair",
+    # Daily utility
+    "bottle", "cup", "laptop", "cell phone",
+    # Surface dangers (detectable via general model)
+    "fire hydrant", "parking meter",
+]
+
+eye_of_blind_list = DANGER_OBJECTS + WARNING_OBJECTS
 
 cap = cv2.VideoCapture(0)
+last_spoken_time = 0
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -48,62 +56,57 @@ while cap.isOpened():
 
     h, w, _ = frame.shape
     
-    # Run both models
-    results_custom = custom_model(frame, imgsz=640, conf=0.2)
-    results_general = general_model(frame, imgsz=640, conf=0.25)
+    # Running both models
+    results_c = custom_model(frame, imgsz=640, conf=0.2)
+    results_g = general_model(frame, imgsz=640, conf=0.25)
 
     detected_objects = {}
 
-    for r in (results_custom + results_general):
+    for r in (results_c + results_g):
         for box in r.boxes:
             label = r.names[int(box.cls[0])]
-
-            if label not in eye_of_blind_list:
-                continue
+            if label not in eye_of_blind_list: continue
 
             x1, y1, x2, y2 = box.xyxy[0]
             box_area = (x2 - x1) * (y2 - y1)
             
             if box_area > 120000:
                 zone = "DANGER"
-            elif box_area > 50000:
+            elif box_area > 60000:
                 zone = "WARNING"
             else:
                 zone = "SAFE"
 
+            # Horizontal position logic
             norm_x = ((x1 + x2) / 2) / w
-            if norm_x < 0.33: direction = "on your left"
-            elif norm_x < 0.67: direction = "straight ahead"
-            else: direction = "on your right"
+            if norm_x < 0.33: pos = "on your left"
+            elif norm_x < 0.67: pos = "straight ahead"
+            else: pos = "on your right"
+
+            # Priority: DANGER objects always override
+            priority = "HIGH" if label in DANGER_OBJECTS and zone == "DANGER" else "NORMAL"
 
             if label not in detected_objects:
-                detected_objects[label] = {"count": 1, "direction": direction, "zone": zone}
-            else:
-                detected_objects[label]["count"] += 1
+                detected_objects[label] = {"pos": pos, "zone": zone, "priority": priority}
+            
+            # Print vibration feedback
+            if zone == "DANGER": print(f"📳📳📳 STRONG | {label} {pos}")
+            elif zone == "WARNING": print(f"📳📳 MEDIUM | {label} {pos}")
 
-    for label, data in detected_objects.items():
-        direction = data["direction"]
-        zone = data["zone"]
+    # Speak findings — HIGH priority bypasses cooldown
+    now = time.time()
+    high_priority = [d for d in detected_objects.values() if d["priority"] == "HIGH"]
+    normal = [d for d in detected_objects.values() if d["priority"] == "NORMAL" and d["zone"] != "SAFE"]
 
-        print(f"{zone} | {label} {direction}")
-        vibrate(zone)
-
-        now = time.time()
-
-        if zone == "DANGER":
-            message = "STOP"
-        elif zone == "WARNING":
-            message = f"{label} {direction}"
-        else:
-            continue
-
-        priority_labels = ["stair", "car"]
-        is_priority = label in priority_labels and zone == "DANGER"
-
-        if message != last_spoken or is_priority or (now - last_spoken_time) > COOLDOWN_SECONDS:
-            speak(message)
-            last_spoken = message
-            last_spoken_time = now
+    if high_priority:
+        msg = "STOP. " + ", ".join(f"{l} {d['pos']}" for l, d in detected_objects.items() if d["priority"] == "HIGH")
+        speak(msg)
+        last_spoken_time = now
+    elif normal and (now - last_spoken_time) > 3:
+        msg = ", ".join(f"{l} {d['pos']}" for l, d in detected_objects.items() if d["priority"] == "NORMAL" and d["zone"] != "SAFE")
+        print(f"AI Voice: {msg}")
+        speak(msg)
+        last_spoken_time = now
 
     cv2.imshow("E-mboni AI Engine", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'): break
