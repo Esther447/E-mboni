@@ -96,7 +96,10 @@ while cap.isOpened():
         else:
             continue
 
-        if message != last_spoken or (now - last_spoken_time) > COOLDOWN_SECONDS:
+        priority_labels = ["stair", "car"]
+        is_priority = label in priority_labels and zone == "DANGER"
+
+        if message != last_spoken or is_priority or (now - last_spoken_time) > COOLDOWN_SECONDS:
             speak(message)
             last_spoken = message
             last_spoken_time = now
