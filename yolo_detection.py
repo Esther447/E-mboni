@@ -30,9 +30,10 @@ def vibrate(zone):
 custom_model = YOLO("yolov8n.onnx")
 general_model = YOLO("yolov8n.pt")
 
-road_obstacles = [
-    "person", "car", "bottle", "laptop", "cell phone",
-    "bed", "door", "sofa", "stair", "table", "toilet"
+eye_of_blind_list = [
+    "person", "car", "bicycle", "stop sign", "traffic light",
+    "cell phone", "laptop", "bottle", "cup", "chair",
+    "door", "stair", "bed", "toilet", "sofa", "table"
 ]
 
 last_spoken = ""
@@ -57,7 +58,7 @@ while cap.isOpened():
         for box in r.boxes:
             label = r.names[int(box.cls[0])]
 
-            if label not in road_obstacles:
+            if label not in eye_of_blind_list:
                 continue
 
             x1, y1, x2, y2 = box.xyxy[0]
