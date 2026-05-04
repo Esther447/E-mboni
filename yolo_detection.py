@@ -45,7 +45,7 @@ while cap.isOpened():
         break
 
     h, w, _ = frame.shape
-    results = model(frame, imgsz=640, conf=0.6)
+    results = model(frame, imgsz=640, conf=0.25)
 
     detected_objects = {}
 
