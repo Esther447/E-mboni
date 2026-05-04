@@ -84,53 +84,58 @@ while cap.isOpened():
 
             x1, y1, x2, y2 = box.xyxy[0]
             box_area = (x2 - x1) * (y2 - y1)
-            
-            if box_area > 120000:
-                zone = "DANGER"
-            elif box_area > 60000:
-                zone = "WARNING"
-            else:
-                zone = "SAFE"
 
-            # Horizontal position logic
+            # box_area thresholds:
+            # > 120000 → ~< 1m  (VERY CLOSE)
+            # > 60000  → ~< 2m  (CLOSE)
+            # <= 60000 → FAR
+
+            # Priority with distance gating per table
+            if label in DANGER_OBJECTS:
+                # HIGH: any distance — immediate voice + strong vibration
+                priority = "HIGH"
+                vibration = "📳📳📳 STRONG"
+            elif label in NAVIGATION_OBJECTS and box_area > 60000:
+                # MEDIUM: < 2m — voice direction + light vibration
+                priority = "MEDIUM"
+                vibration = "📳 LIGHT"
+            elif label in UTILITY_OBJECTS and box_area > 120000:
+                # LOW: < 1m — voice only, slow cooldown
+                priority = "LOW"
+                vibration = None
+            else:
+                priority = "NONE"
+                vibration = None
+
             norm_x = ((x1 + x2) / 2) / w
             if norm_x < 0.33: pos = "on your left"
             elif norm_x < 0.67: pos = "straight ahead"
             else: pos = "on your right"
 
-            # Priority assignment
-            if label in DANGER_OBJECTS and zone == "DANGER":
-                priority = "HIGH"
-            elif label in NAVIGATION_OBJECTS and zone in ["DANGER", "WARNING"]:
-                priority = "MEDIUM"
-            elif label in UTILITY_OBJECTS and zone in ["DANGER", "WARNING"]:
-                priority = "LOW"
-            else:
-                priority = "NONE"
-
             if label not in detected_objects and priority != "NONE":
-                detected_objects[label] = {"pos": pos, "zone": zone, "priority": priority}
-            
-            # Print vibration feedback
-            if zone == "DANGER": print(f"📳📳📳 STRONG | {label} {pos}")
-            elif zone == "WARNING": print(f"📳📳 MEDIUM | {label} {pos}")
+                detected_objects[label] = {"pos": pos, "priority": priority, "vibration": vibration}
 
-    # Speak findings by priority tier
+            if vibration:
+                print(f"{vibration} | {label} {pos}")
+
     now = time.time()
     high   = {l: d for l, d in detected_objects.items() if d["priority"] == "HIGH"}
     medium = {l: d for l, d in detected_objects.items() if d["priority"] == "MEDIUM"}
     low    = {l: d for l, d in detected_objects.items() if d["priority"] == "LOW"}
 
     if high:
+        # Immediate voice + strong vibration — no cooldown
         msg = "STOP. " + ", ".join(f"{l} {d['pos']}" for l, d in high.items())
         speak(msg)
         last_spoken_time = now
     elif medium and (now - last_spoken_time) > 3:
+        # Voice direction + light vibration — 3s cooldown
         msg = ", ".join(f"{l} {d['pos']}" for l, d in medium.items())
         print(f"AI Voice [NAV]: {msg}")
         speak(msg)
         last_spoken_time = now
-    elif low and (now - last_spoken_time) > 5:
+    elif low and (now - last_spoken_time) > 8:
+        # Voice only — slow 8s cooldown
         msg = ", ".join(f"{l} {d['pos']}" for l, d in low.items())
         print(f"AI Voice [UTIL]: {msg}")
         speak(msg)
