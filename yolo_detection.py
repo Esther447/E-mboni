@@ -21,13 +21,11 @@ def speak(text):
         is_speaking = False
     threading.Thread(target=run, daemon=True).start()
 
-def vibrate(level):
-    if level == "VERY CLOSE":
+def vibrate(zone):
+    if zone == "DANGER":
         print("📳📳📳 STRONG VIBRATION")
-    elif level == "CLOSE":
+    elif zone == "WARNING":
         print("📳📳 MEDIUM VIBRATION")
-    elif level == "MEDIUM":
-        print("📳 LIGHT VIBRATION")
 
 custom_model = YOLO("yolov8n.onnx")
 general_model = YOLO("yolov8n.pt")
@@ -65,11 +63,12 @@ while cap.isOpened():
             x1, y1, x2, y2 = box.xyxy[0]
             box_area = (x2 - x1) * (y2 - y1)
             
-            # Simple distance logic based on size
-            if box_area > 150000: distance = "VERY CLOSE"
-            elif box_area > 80000: distance = "CLOSE"
-            elif box_area > 30000: distance = "MEDIUM"
-            else: distance = "FAR"
+            if box_area > 120000:
+                zone = "DANGER"
+            elif box_area > 50000:
+                zone = "WARNING"
+            else:
+                zone = "SAFE"
 
             norm_x = ((x1 + x2) / 2) / w
             if norm_x < 0.33: direction = "on your left"
@@ -77,26 +76,30 @@ while cap.isOpened():
             else: direction = "on your right"
 
             if label not in detected_objects:
-                detected_objects[label] = {"count": 1, "direction": direction, "distance": distance}
+                detected_objects[label] = {"count": 1, "direction": direction, "zone": zone}
             else:
                 detected_objects[label]["count"] += 1
 
     for label, data in detected_objects.items():
         direction = data["direction"]
-        distance = data["distance"]
+        zone = data["zone"]
 
-        # Alert logic
-        print(f"{distance} | {label} {direction}")
-        vibrate(distance)
+        print(f"{zone} | {label} {direction}")
+        vibrate(zone)
 
-        if distance in ["VERY CLOSE", "CLOSE"]:
-            message = f"Warning! {label} {direction}" if label in ["stair", "car", "person"] else f"{label} {direction}"
-            
-            now = time.time()
-            if message != last_spoken or (now - last_spoken_time) > COOLDOWN_SECONDS:
-                speak(message)
-                last_spoken = message
-                last_spoken_time = now
+        now = time.time()
+
+        if zone == "DANGER":
+            message = "STOP"
+        elif zone == "WARNING":
+            message = f"{label} {direction}"
+        else:
+            continue
+
+        if message != last_spoken or (now - last_spoken_time) > COOLDOWN_SECONDS:
+            speak(message)
+            last_spoken = message
+            last_spoken_time = now
 
     cv2.imshow("E-mboni AI Engine", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'): break
