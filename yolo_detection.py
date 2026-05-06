@@ -4,7 +4,7 @@ import pyttsx3
 import threading
 import time
 
-# --- INITIALIZE VOICE ---
+# --- VOICE ENGINE ---
 engine = pyttsx3.init()
 engine.setProperty('rate', 180)
 is_speaking = False
@@ -20,48 +20,73 @@ def speak(text):
         is_speaking = False
     threading.Thread(target=run, daemon=True).start()
 
-# --- LOAD BOTH MODELS ---
-# Custom: Stairs, Doors, etc.
-custom_model = YOLO("yolov8n.onnx") 
-# General: People, Bottles, Cups, Laptops, etc.
-general_model = YOLO("yolov8n.pt") 
+# --- MODELS ---
+custom_model = YOLO("yolov8n.onnx")
+general_model = YOLO("yolov8n.pt")
 
-# Priority tiers for alert logic
+# --- OBJECT TIERS ---
 DANGER_OBJECTS = [
-    # Dynamic obstacles
     "person", "bicycle", "car", "bus", "truck", "motorcycle",
-    # Drop-offs & elevation
-    "stair",
-    # Street hazards
-    "traffic cone", "stop sign", "traffic light",
+    "stair", "traffic cone", "stop sign", "traffic light",
 ]
 
 NAVIGATION_OBJECTS = [
-    # Entry/exit points
-    "door",
-    # Large furniture
-    "sofa", "bed", "dining table", "chair",
-    # Path clearance
-    "potted plant",
-    # Appliance locators
+    "door", "sofa", "bed", "dining table", "chair", "potted plant",
     "refrigerator", "microwave", "oven", "sink", "toilet",
 ]
 
 UTILITY_OBJECTS = [
-    # Personal tech
     "laptop", "cell phone", "keyboard", "mouse", "remote",
-    # Kitchen/dining
     "bottle", "cup", "bowl", "spoon", "fork", "knife",
-    # Common items
     "backpack", "suitcase", "umbrella", "book", "handbag",
-    # Animals (Rwanda environment)
     "dog", "cow", "bird", "cat", "horse",
-    # Surface dangers
     "fire hydrant", "parking meter",
 ]
 
 eye_of_blind_list = DANGER_OBJECTS + NAVIGATION_OBJECTS + UTILITY_OBJECTS
 
+
+# --- HELPER FUNCTIONS ---
+def get_direction(norm_x):
+    if norm_x < 0.33: return "on your left"
+    elif norm_x < 0.67: return "straight ahead"
+    return "on your right"
+
+def get_priority(label):
+    if label in DANGER_OBJECTS: return "HIGH"
+    if label in NAVIGATION_OBJECTS: return "MEDIUM"
+    if label in UTILITY_OBJECTS: return "LOW"
+    return "NONE"
+
+def process_detections(raw_detections):
+    payload = []
+    for det in raw_detections:
+        direction = get_direction(det["norm_x"])
+        priority = get_priority(det["label"])
+
+        if priority == "HIGH":
+            vibe = "STRONG"
+            speech = f"STOP. {det['label']} {direction}"
+        elif priority == "MEDIUM" and det["box_area"] > 60000:
+            vibe = "LIGHT"
+            speech = f"{det['label']} {direction}"
+        elif priority == "LOW" and det["box_area"] > 120000:
+            vibe = None
+            speech = f"{det['label']} {direction}"
+        else:
+            continue
+
+        payload.append({
+            "object": det["label"],
+            "side": direction,
+            "priority": priority,
+            "vibe": vibe,
+            "speech": speech
+        })
+    return payload
+
+
+# --- MAIN LOOP ---
 cap = cv2.VideoCapture(0)
 last_spoken_time = 0
 
@@ -70,73 +95,51 @@ while cap.isOpened():
     if not ret: break
 
     h, w, _ = frame.shape
-    
-    # Running both models
+
     results_c = custom_model(frame, imgsz=640, conf=0.2)
     results_g = general_model(frame, imgsz=640, conf=0.25)
 
-    detected_objects = {}
+    # Collect raw detections
+    raw_detections = []
+    seen_labels = set()
 
     for r in (results_c + results_g):
         for box in r.boxes:
             label = r.names[int(box.cls[0])]
-            if label not in eye_of_blind_list: continue
-
+            if label not in eye_of_blind_list or label in seen_labels:
+                continue
             x1, y1, x2, y2 = box.xyxy[0]
-            box_area = (x2 - x1) * (y2 - y1)
+            raw_detections.append({
+                "label": label,
+                "box_area": float((x2 - x1) * (y2 - y1)),
+                "norm_x": float(((x1 + x2) / 2) / w),
+            })
+            seen_labels.add(label)
 
-            # box_area thresholds:
-            # > 120000 → ~< 1m  (VERY CLOSE)
-            # > 60000  → ~< 2m  (CLOSE)
-            # <= 60000 → FAR
+    # Process into structured payload
+    payload = process_detections(raw_detections)
 
-            # Priority with distance gating per table
-            if label in DANGER_OBJECTS:
-                # HIGH: any distance — immediate voice + strong vibration
-                priority = "HIGH"
-                vibration = "📳📳📳 STRONG"
-            elif label in NAVIGATION_OBJECTS and box_area > 60000:
-                # MEDIUM: < 2m — voice direction + light vibration
-                priority = "MEDIUM"
-                vibration = "📳 LIGHT"
-            elif label in UTILITY_OBJECTS and box_area > 120000:
-                # LOW: < 1m — voice only, slow cooldown
-                priority = "LOW"
-                vibration = None
-            else:
-                priority = "NONE"
-                vibration = None
-
-            norm_x = ((x1 + x2) / 2) / w
-            if norm_x < 0.33: pos = "on your left"
-            elif norm_x < 0.67: pos = "straight ahead"
-            else: pos = "on your right"
-
-            if label not in detected_objects and priority != "NONE":
-                detected_objects[label] = {"pos": pos, "priority": priority, "vibration": vibration}
-
-            if vibration:
-                print(f"{vibration} | {label} {pos}")
-
+    # Act on payload
     now = time.time()
-    high   = {l: d for l, d in detected_objects.items() if d["priority"] == "HIGH"}
-    medium = {l: d for l, d in detected_objects.items() if d["priority"] == "MEDIUM"}
-    low    = {l: d for l, d in detected_objects.items() if d["priority"] == "LOW"}
+    high   = [p for p in payload if p["priority"] == "HIGH"]
+    medium = [p for p in payload if p["priority"] == "MEDIUM"]
+    low    = [p for p in payload if p["priority"] == "LOW"]
+
+    for p in payload:
+        if p["vibe"]:
+            print(f"📳 {p['vibe']} | {p['object']} {p['side']}")
 
     if high:
-        # Immediate voice + strong vibration — no cooldown
-        msg = "STOP. " + ", ".join(f"{l} {d['pos']}" for l, d in high.items())
+        msg = "STOP. " + ", ".join(p["speech"].replace("STOP. ", "") for p in high)
         speak(msg)
         last_spoken_time = now
     elif medium and (now - last_spoken_time) > 3:
-        # Voice direction + light vibration — 3s cooldown
-        msg = ", ".join(f"{l} {d['pos']}" for l, d in medium.items())
+        msg = ", ".join(p["speech"] for p in medium)
         print(f"AI Voice [NAV]: {msg}")
         speak(msg)
         last_spoken_time = now
     elif low and (now - last_spoken_time) > 8:
-        # Voice only — slow 8s cooldown
-        msg = ", ".join(f"{l} {d['pos']}" for l, d in low.items())
+        msg = ", ".join(p["speech"] for p in low)
         print(f"AI Voice [UTIL]: {msg}")
         speak(msg)
         last_spoken_time = now
