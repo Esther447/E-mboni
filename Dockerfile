@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Install minimal system dependencies for AI
+# Install minimal system dependencies
 RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Render's dynamic port assignment
-EXPOSE 10000
+# Render ignores EXPOSE, but this is good practice
+EXPOSE 8000 
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+# Use shell form (no brackets) to allow $PORT substitution
+CMD uvicorn main:app --host 0.0.0.0 --port $PORT
