@@ -3,6 +3,10 @@ import cv2
 import pyttsx3
 import threading
 import time
+from spatial_engine import (
+    RawDetection, process_detections, ALL_OBJECTS
+)
+from memory import MemoryEngine
 
 # --- VOICE ENGINE ---
 engine = pyttsx3.init()
@@ -24,92 +28,7 @@ def speak(text):
 custom_model = YOLO("yolov8n.onnx")
 general_model = YOLO("yolov8n.pt")
 
-# --- OBJECT TIERS ---
-DANGER_OBJECTS = [
-    "person", "bicycle", "car", "bus", "truck", "motorcycle",
-    "stair", "traffic cone", "stop sign", "traffic light",
-]
-
-NAVIGATION_OBJECTS = [
-    "door", "sofa", "bed", "dining table", "chair", "potted plant",
-    "refrigerator", "microwave", "oven", "sink", "toilet",
-]
-
-UTILITY_OBJECTS = [
-    "laptop", "cell phone", "keyboard", "mouse", "remote",
-    "bottle", "cup", "bowl", "spoon", "fork", "knife",
-    "backpack", "suitcase", "umbrella", "book", "handbag",
-    "dog", "cow", "bird", "cat", "horse",
-    "fire hydrant", "parking meter",
-]
-
-eye_of_blind_list = DANGER_OBJECTS + NAVIGATION_OBJECTS + UTILITY_OBJECTS
-
-
-# --- HELPER FUNCTIONS ---
-def get_distance(box_area):
-    if box_area > 150000: return "50 centimeters"
-    elif box_area > 120000: return "1 meter"
-    elif box_area > 60000: return "2 meters"
-    elif box_area > 30000: return "3 to 4 meters"
-    return None
-
-def get_direction(norm_x, norm_y):
-    if norm_y < 0.3:
-        vertical = "high"
-    elif norm_y > 0.7:
-        vertical = "low"
-    else:
-        vertical = None
-
-    if norm_x < 0.2:   horizontal = "to your far left"
-    elif norm_x < 0.4: horizontal = "on your left"
-    elif norm_x <= 0.6: horizontal = "straight ahead"
-    elif norm_x <= 0.8: horizontal = "on your right"
-    else:               horizontal = "to your far right"
-
-    if vertical:
-        return f"{horizontal}, {vertical}"
-    return horizontal
-
-def get_priority(label):
-    if label in DANGER_OBJECTS: return "HIGH"
-    if label in NAVIGATION_OBJECTS: return "MEDIUM"
-    if label in UTILITY_OBJECTS: return "LOW"
-    return "NONE"
-
-def process_detections(raw_detections):
-    payload = []
-    for det in raw_detections:
-        direction = get_direction(det["norm_x"], det["norm_y"])
-        priority = get_priority(det["label"])
-
-        if priority == "HIGH":
-            vibe = "STRONG"
-            distance = get_distance(det["box_area"])
-            dist_str = f", {distance}" if distance else ""
-            speech = f"STOP. {det['label']} {direction}{dist_str}"
-        elif priority == "MEDIUM" and det["box_area"] > 60000:
-            vibe = "LIGHT"
-            distance = get_distance(det["box_area"])
-            dist_str = f", {distance}" if distance else ""
-            speech = f"{det['label']} {direction}{dist_str}"
-        elif priority == "LOW" and det["box_area"] > 120000:
-            vibe = None
-            distance = get_distance(det["box_area"])
-            dist_str = f", {distance}" if distance else ""
-            speech = f"{det['label']} {direction}{dist_str}"
-        else:
-            continue
-
-        payload.append({
-            "object": det["label"],
-            "side": direction,
-            "priority": priority,
-            "vibe": vibe,
-            "speech": speech
-        })
-    return payload
+eye_of_blind_list = ALL_OBJECTS
 
 
 # --- MAIN LOOP ---
@@ -123,6 +42,7 @@ if not cap.isOpened():
 speak("E-mboni started. Camera is ready.")
 print("E-mboni AI Engine started. Camera opened.")
 
+memory = MemoryEngine()
 last_spoken_time = 0
 
 while cap.isOpened():
@@ -144,40 +64,58 @@ while cap.isOpened():
             if label not in eye_of_blind_list or label in seen_labels:
                 continue
             x1, y1, x2, y2 = box.xyxy[0]
-            raw_detections.append({
-                "label": label,
-                "box_area": float((x2 - x1) * (y2 - y1)),
-                "norm_x": float(((x1 + x2) / 2) / w),
-                "norm_y": float(((y1 + y2) / 2) / h),
-            })
+            raw_detections.append(RawDetection(
+                label=label,
+                box_area=float((x2 - x1) * (y2 - y1)),
+                norm_x=float(((x1 + x2) / 2) / w),
+                norm_y=float(((y1 + y2) / 2) / h),
+            ))
             seen_labels.add(label)
 
-    # Process into structured payload
     payload = process_detections(raw_detections)
 
-    # Act on payload
-    now = time.time()
-    high   = [p for p in payload if p["priority"] == "HIGH"]
-    medium = [p for p in payload if p["priority"] == "MEDIUM"]
-    low    = [p for p in payload if p["priority"] == "LOW"]
-
+    # --- TEMPORAL FILTER: suppress known/stationary objects ---
+    new_detections = []
     for p in payload:
-        if p["vibe"]:
-            print(f"📳 {p['vibe']} | {p['object']} {p['side']}")
+        # Find matching raw detection for position data
+        raw = next((r for r in raw_detections if r.label == p.object), None)
+        if raw and memory.is_known(p.object, raw.norm_x, raw.norm_y):
+            continue  # already reported at same position — stay silent
+        if raw:
+            memory.remember(p.object, raw.norm_x, raw.norm_y, p.priority)
+        new_detections.append(p)
+
+    # --- STATE MONITOR: path clear trigger ---
+    has_obstacles = any(p.priority in ["HIGH", "MEDIUM"] for p in payload)
+    path_clear_msg = memory.check_path_clear(has_obstacles)
+
+    # Act on new detections only
+    now = time.time()
+    high   = [p for p in new_detections if p.priority == "HIGH"]
+    medium = [p for p in new_detections if p.priority == "MEDIUM"]
+    low    = [p for p in new_detections if p.priority == "LOW"]
+
+    for p in new_detections:
+        if p.vibe:
+            print(f"📳 {p.vibe} | {p.object} {p.direction}")
 
     if high:
-        msg = "STOP. " + ", ".join(p["speech"].replace("STOP. ", "") for p in high)
+        msg = "STOP. " + ", ".join(p.speech.replace("STOP. ", "") for p in high)
         speak(msg)
         last_spoken_time = now
     elif medium and (now - last_spoken_time) > 3:
-        msg = ", ".join(p["speech"] for p in medium)
+        msg = ", ".join(p.speech for p in medium)
         print(f"AI Voice [NAV]: {msg}")
         speak(msg)
         last_spoken_time = now
     elif low and (now - last_spoken_time) > 8:
-        msg = ", ".join(p["speech"] for p in low)
+        msg = ", ".join(p.speech for p in low)
         print(f"AI Voice [UTIL]: {msg}")
         speak(msg)
+        last_spoken_time = now
+    elif path_clear_msg:
+        print(f"AI Voice: {path_clear_msg}")
+        speak(path_clear_msg)
         last_spoken_time = now
 
     try:
