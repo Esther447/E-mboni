@@ -33,6 +33,18 @@ RETREATING_THRESHOLD = -0.20  # 20% area shrink = moving away
 CROWD_THRESHOLD = 3
 CROWD_NEAR_AREA = 60000  # box_area proxy for ~2 metres
 
+# Ghosting: frames to keep object in memory after it disappears
+GHOST_FRAMES = 3
+
+# Path clear: consecutive clean frames required before announcing
+PATH_CLEAR_FRAMES = 10
+
+# Bottom zone: norm_y threshold for ground-level priority (Rwanda terrain)
+BOTTOM_ZONE_Y = 0.80
+
+# Time-to-collision: box_area growth % over 2 frames to trigger STOP
+TTC_THRESHOLD = 0.20  # 20% growth in 2 frames = imminent collision
+
 
 class MotionState:
     APPROACHING = "APPROACHING"   # box_area growing fast — escalate to HIGH
@@ -48,12 +60,27 @@ class CachedObject:
     norm_y: float
     priority: str
     last_seen: float = field(default_factory=time.time)
-    first_reported: Optional[float] = None        # time of first report
-    stationary_muted_at: Optional[float] = None   # time mute period started
+    first_reported: Optional[float] = None
+    stationary_muted_at: Optional[float] = None
+    ghost_frames_remaining: int = 0          # frames to keep alive after disappearing
     area_history: deque = field(default_factory=lambda: deque(maxlen=MOTION_WINDOW))
+    last_two_areas: deque = field(default_factory=lambda: deque(maxlen=2))  # for TTC
 
     def update_area(self, box_area: float):
         self.area_history.append(box_area)
+        self.last_two_areas.append(box_area)
+
+    def get_ttc_critical(self) -> bool:
+        """
+        Time-to-Collision check over last 2 frames.
+        Returns True if box grew >= 20% — imminent collision, skip all polite logic.
+        """
+        if len(self.last_two_areas) < 2:
+            return False
+        old, new = self.last_two_areas[0], self.last_two_areas[1]
+        if old == 0:
+            return False
+        return (new - old) / old >= TTC_THRESHOLD
 
     def get_motion_state(self) -> str:
         """Compares oldest vs newest area over MOTION_WINDOW frames."""
@@ -73,14 +100,29 @@ class CachedObject:
 
 class MemoryEngine:
     """
-    Tracks recently reported objects to suppress repeated alerts.
-    Also monitors obstacle state to trigger "Path clear" only on
-    transition from obstacles → no obstacles.
+    Full intelligence engine:
+    - Temporal filtering (suppress known objects)
+    - Ghosting timer (keep objects alive for GHOST_FRAMES after disappearing)
+    - TTC (Time-to-Collision) fast escalation
+    - 10-frame path clear certainty
+    - Vibration lock for bottom zone (Rwanda terrain)
+    - Stationary 20s mute period
     """
 
     def __init__(self):
         self._cache: dict[str, CachedObject] = {}
         self._prev_had_obstacles: bool = False
+        self._clean_frame_count: int = 0      # consecutive frames with no HIGH/MEDIUM
+        self._vibe_lock: bool = False          # True = continuous vibration active
+        self._vibe_lock_label: Optional[str] = None
+
+    @property
+    def vibe_locked(self) -> bool:
+        return self._vibe_lock
+
+    @property
+    def vibe_lock_label(self) -> Optional[str]:
+        return self._vibe_lock_label
 
     def _is_same_position(self, cached: CachedObject, norm_x: float, norm_y: float) -> bool:
         """Returns True if the new detection is close enough to the cached one."""
@@ -90,10 +132,15 @@ class MemoryEngine:
         )
 
     def _evict_expired(self):
-        """Remove objects not seen within MEMORY_TTL seconds."""
+        """Remove objects not seen within MEMORY_TTL seconds AND ghost frames exhausted."""
         now = time.time()
-        expired = [k for k, v in self._cache.items() if now - v.last_seen > MEMORY_TTL]
-        for k in expired:
+        to_remove = []
+        for k, v in self._cache.items():
+            if now - v.last_seen > MEMORY_TTL and v.ghost_frames_remaining <= 0:
+                to_remove.append(k)
+            elif now - v.last_seen > MEMORY_TTL:
+                v.ghost_frames_remaining -= 1  # count down ghost frames
+        for k in to_remove:
             del self._cache[k]
 
     def is_known(self, label: str, norm_x: float, norm_y: float) -> bool:
@@ -124,8 +171,8 @@ class MemoryEngine:
     def track(self, label: str, norm_x: float, norm_y: float,
               box_area: float, priority: str) -> str:
         """
-        Updates area history for an object and returns its current MotionState.
-        Call this every frame for every detected object.
+        Updates area history and returns MotionState.
+        Also resets ghost frames when object is seen again.
         """
         if label not in self._cache:
             self._cache[label] = CachedObject(
@@ -135,8 +182,31 @@ class MemoryEngine:
         cached.norm_x = norm_x
         cached.norm_y = norm_y
         cached.last_seen = time.time()
+        cached.ghost_frames_remaining = GHOST_FRAMES  # reset ghost on detection
         cached.update_area(box_area)
         return cached.get_motion_state()
+
+    def is_ttc_critical(self, label: str) -> bool:
+        """Returns True if object grew 20%+ in last 2 frames — imminent collision."""
+        cached = self._cache.get(label)
+        return cached.get_ttc_critical() if cached else False
+
+    def update_vibe_lock(self, raw_detections: list):
+        """
+        Vibration lock for bottom zone (Rwanda terrain).
+        If stair/ground hazard detected in bottom 20% of frame,
+        lock continuous vibration until zone is clear.
+        """
+        bottom_hazards = [
+            r for r in raw_detections
+            if r.norm_y > BOTTOM_ZONE_Y and r.label in ["stair", "fire hydrant", "parking meter"]
+        ]
+        if bottom_hazards:
+            self._vibe_lock = True
+            self._vibe_lock_label = bottom_hazards[0].label
+        else:
+            self._vibe_lock = False
+            self._vibe_lock_label = None
 
     def remember(self, label: str, norm_x: float, norm_y: float, priority: str):
         """Mark object as reported. Starts stationary mute period if applicable."""
@@ -158,15 +228,21 @@ class MemoryEngine:
 
     def check_path_clear(self, has_obstacles: bool) -> Optional[str]:
         """
-        State-change monitor.
-        Returns "Path clear." ONLY when transitioning from obstacles → no obstacles.
-        Returns None in all other cases (prevents constant chatter in empty hallways).
+        Requires PATH_CLEAR_FRAMES (10) consecutive clean frames before
+        announcing path clear. Immediately resets if obstacle reappears.
         """
-        msg = None
-        if self._prev_had_obstacles and not has_obstacles:
-            msg = "Path clear."
-        self._prev_had_obstacles = has_obstacles
-        return msg
+        if has_obstacles:
+            self._clean_frame_count = 0
+            self._prev_had_obstacles = True
+            return None
+
+        if self._prev_had_obstacles:
+            self._clean_frame_count += 1
+            if self._clean_frame_count >= PATH_CLEAR_FRAMES:
+                self._clean_frame_count = 0
+                self._prev_had_obstacles = False
+                return "Path clear."
+        return None
 
 
 # ---------------------------------------------------------------------------

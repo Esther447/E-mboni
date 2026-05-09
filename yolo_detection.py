@@ -75,11 +75,16 @@ while cap.isOpened():
 
     payload = process_detections(raw_detections)
 
+    # --- VIBRATION LOCK: bottom zone ground hazards (Rwanda terrain) ---
+    memory.update_vibe_lock(raw_detections)
+    if memory.vibe_locked:
+        print(f"📳📳📳 VIBE LOCK | {memory.vibe_lock_label} in bottom zone")
+
     # --- MOTION TRACKING: update area history every frame ---
     for raw in raw_detections:
         memory.track(raw.label, raw.norm_x, raw.norm_y, raw.box_area, "")
 
-    # --- TEMPORAL FILTER + MOTION ESCALATION ---
+    # --- TEMPORAL FILTER + TTC + MOTION ESCALATION ---
     new_detections = []
     for p in payload:
         raw = next((r for r in raw_detections if r.label == p.object), None)
@@ -88,7 +93,16 @@ while cap.isOpened():
 
         motion = memory.track(raw.label, raw.norm_x, raw.norm_y, raw.box_area, p.priority)
 
-        # Escalate approaching objects to HIGH regardless of original priority
+        # TTC: 20% growth in 2 frames — skip all polite logic, shout STOP immediately
+        if memory.is_ttc_critical(raw.label):
+            p.priority = "HIGH"
+            p.vibe = "STRONG"
+            p.speech = f"STOP! {p.object} approaching fast {p.direction}"
+            new_detections.append(p)
+            memory.remember(p.object, raw.norm_x, raw.norm_y, p.priority)
+            continue
+
+        # Escalate approaching objects to HIGH
         if motion == MotionState.APPROACHING:
             p.priority = "HIGH"
             p.vibe = "STRONG"
