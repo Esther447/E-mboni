@@ -47,10 +47,23 @@ eye_of_blind_list = DANGER_OBJECTS + NAVIGATION_OBJECTS + UTILITY_OBJECTS
 
 
 # --- HELPER FUNCTIONS ---
-def get_direction(norm_x):
-    if norm_x < 0.33: return "on your left"
-    elif norm_x < 0.67: return "straight ahead"
-    return "on your right"
+def get_direction(norm_x, norm_y):
+    if norm_y < 0.3:
+        vertical = "high"
+    elif norm_y > 0.7:
+        vertical = "low"
+    else:
+        vertical = None
+
+    if norm_x < 0.2:   horizontal = "to your far left"
+    elif norm_x < 0.4: horizontal = "on your left"
+    elif norm_x <= 0.6: horizontal = "straight ahead"
+    elif norm_x <= 0.8: horizontal = "on your right"
+    else:               horizontal = "to your far right"
+
+    if vertical:
+        return f"{horizontal}, {vertical}"
+    return horizontal
 
 def get_priority(label):
     if label in DANGER_OBJECTS: return "HIGH"
@@ -61,7 +74,7 @@ def get_priority(label):
 def process_detections(raw_detections):
     payload = []
     for det in raw_detections:
-        direction = get_direction(det["norm_x"])
+        direction = get_direction(det["norm_x"], det["norm_y"])
         priority = get_priority(det["label"])
 
         if priority == "HIGH":
@@ -113,6 +126,7 @@ while cap.isOpened():
                 "label": label,
                 "box_area": float((x2 - x1) * (y2 - y1)),
                 "norm_x": float(((x1 + x2) / 2) / w),
+                "norm_y": float(((y1 + y2) / 2) / h),
             })
             seen_labels.add(label)
 
@@ -144,8 +158,11 @@ while cap.isOpened():
         speak(msg)
         last_spoken_time = now
 
-    cv2.imshow("E-mboni AI Engine", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'): break
+    try:
+        cv2.imshow("E-mboni AI Engine", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
+    except cv2.error:
+        pass  # headless environment — skip display
 
 cap.release()
 cv2.destroyAllWindows()

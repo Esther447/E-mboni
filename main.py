@@ -38,10 +38,23 @@ UTILITY_OBJECTS = [
 eye_of_blind_list = DANGER_OBJECTS + NAVIGATION_OBJECTS + UTILITY_OBJECTS
 
 
-def get_direction(norm_x):
-    if norm_x < 0.33: return "on your left"
-    elif norm_x < 0.67: return "straight ahead"
-    return "on your right"
+def get_direction(norm_x, norm_y):
+    if norm_y < 0.3:
+        vertical = "high"
+    elif norm_y > 0.7:
+        vertical = "low"
+    else:
+        vertical = None
+
+    if norm_x < 0.2:    horizontal = "to your far left"
+    elif norm_x < 0.4:  horizontal = "on your left"
+    elif norm_x <= 0.6: horizontal = "straight ahead"
+    elif norm_x <= 0.8: horizontal = "on your right"
+    else:               horizontal = "to your far right"
+
+    if vertical:
+        return f"{horizontal}, {vertical}"
+    return horizontal
 
 def get_priority_and_vibe(label, box_area):
     if label in DANGER_OBJECTS:
@@ -75,12 +88,13 @@ async def detect(file: UploadFile = File(...)):
             x1, y1, x2, y2 = box.xyxy[0]
             box_area = float((x2 - x1) * (y2 - y1))
             norm_x = float(((x1 + x2) / 2) / w)
+            norm_y = float(((y1 + y2) / 2) / h)
 
             priority, vibe = get_priority_and_vibe(label, box_area)
             if priority == "NONE":
                 continue
 
-            direction = get_direction(norm_x)
+            direction = get_direction(norm_x, norm_y)
 
             if priority == "HIGH":
                 speech = f"STOP. {label} {direction}"
