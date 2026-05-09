@@ -1,9 +1,10 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import cv2
 import numpy as np
 from ultralytics import YOLO
 import uvicorn
+from roles import Role, can_access, get_allowed_api_routes
 
 app = FastAPI()
 
@@ -74,7 +75,15 @@ def get_priority_and_vibe(label, box_area):
 
 
 @app.post("/detect")
-async def detect(file: UploadFile = File(...)):
+async def detect(file: UploadFile = File(...), x_role: str = Header(default="user")):
+    try:
+        role = Role(x_role.lower())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Invalid role")
+
+    if not can_access(role, "realtime_ai"):
+        raise HTTPException(status_code=403, detail=f"Role '{role}' cannot access real-time detection")
+
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -127,6 +136,44 @@ async def detect(file: UploadFile = File(...)):
 
     # Return top detection only to keep voice clean
     return {"detections": payload[:1]}
+
+
+# --- GUARDIAN ENDPOINTS ---
+@app.get("/alerts")
+async def get_alerts(x_role: str = Header(default="guardian")):
+    try:
+        role = Role(x_role.lower())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Invalid role")
+    if not can_access(role, "emergency_alerts"):
+        raise HTTPException(status_code=403, detail="Access denied")
+    # Returns text-based alerts only — no camera, no location
+    return {"alerts": [], "note": "Text alerts only. No camera or location data."}
+
+
+@app.get("/location/last-known")
+async def last_known_location(x_role: str = Header(default="guardian")):
+    try:
+        role = Role(x_role.lower())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Invalid role")
+    if not can_access(role, "last_known_location"):
+        raise HTTPException(status_code=403, detail="Access denied")
+    # Only returned if user has enabled location sharing
+    return {"location": None, "sharing_enabled": False}
+
+
+# --- ADMIN ENDPOINTS ---
+@app.get("/devices/status")
+async def device_status(x_role: str = Header(default="admin")):
+    try:
+        role = Role(x_role.lower())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Invalid role")
+    if not can_access(role, "device_management"):
+        raise HTTPException(status_code=403, detail="Access denied")
+    # Online/Offline only — no personal data, no location, no camera
+    return {"status": "online", "note": "Device status only. No user data accessible."}
 
 
 if __name__ == "__main__":
