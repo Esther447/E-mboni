@@ -2,5 +2,8 @@ fastapi
 uvicorn
 python-multipart
 ultralytics
-opencv-python-headless
+opencv-python
 onnxruntime
+sqlalchemy
+bcrypt
+python-jose[cryptography]

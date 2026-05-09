@@ -2,9 +2,10 @@
 
 ## Overview
 E-mboni is an AI-powered assistive navigation system for visually impaired users.
-It uses a laptop/phone camera to detect objects in real time and provides:
+It uses a camera to detect objects in real time and provides:
 - Voice alerts (direction + object type)
 - Simulated vibration feedback (to be wired to Android in Phase 2)
+- REST API for frontend (Flutter/Diane's UI) integration
 
 ---
 
@@ -12,11 +13,14 @@ It uses a laptop/phone camera to detect objects in real time and provides:
 
 ```
 E-mboni/
-├── yolo_detection.py         # Main AI detection engine (run this)
+├── yolo_detection.py         # Local real-time detection engine (webcam)
+├── main.py                   # FastAPI server — REST API for frontend
 ├── train_model.py            # Fine-tunes YOLOv8 on custom dataset
 ├── export_model.py           # Copies best.onnx to root after training
 ├── navigation_data.yaml      # Dataset config used for training
 ├── data.yaml                 # Original Roboflow dataset config
+├── requirements.txt          # Python dependencies
+├── Dockerfile                # Docker config for Render deployment
 ├── yolov8n.onnx              # Custom trained model (7 indoor classes)
 ├── yolov8n.pt                # Pretrained general model (80 COCO classes)
 ├── train/                    # Training images + labels (from Roboflow)
@@ -40,7 +44,7 @@ E-mboni/
 - 80 classes (people, cars, phones, animals, etc.)
 - conf=0.25
 
-Both models run every frame. Results are merged and filtered through `eye_of_blind_list`.
+Both models run on every frame. Results are merged and filtered through `eye_of_blind_list`.
 
 ---
 
@@ -97,6 +101,58 @@ Both models run every frame. Results are merged and filtered through `eye_of_bli
 
 ---
 
+## Helper Functions (Frontend-Ready)
+
+```python
+get_direction(norm_x)         # Returns: "on your left" / "straight ahead" / "on your right"
+get_priority(label)           # Returns: "HIGH" / "MEDIUM" / "LOW" / "NONE"
+process_detections(raw_list)  # Returns: JSON payload list
+```
+
+### JSON Payload Format (per detection)
+```json
+{
+  "object": "person",
+  "direction": "straight ahead",
+  "priority": "HIGH",
+  "vibe": "STRONG",
+  "speech": "STOP. person straight ahead"
+}
+```
+
+---
+
+## REST API (main.py)
+
+### Endpoint
+```
+POST /detect
+```
+
+### Request
+- Content-Type: `multipart/form-data`
+- Body: image file (jpg/png)
+
+### Response
+```json
+{
+  "detections": [
+    {
+      "object": "person",
+      "direction": "straight ahead",
+      "priority": "HIGH",
+      "vibe": "STRONG",
+      "speech": "STOP. person straight ahead"
+    }
+  ]
+}
+```
+
+- Returns only the top 1 detection (highest priority) to keep voice clean
+- CORS enabled for all origins — Diane's Flutter frontend can call this directly
+
+---
+
 ## Voice System
 - Engine: `pyttsx3` (offline, no internet needed)
 - Speed: 180 wpm
@@ -106,13 +162,55 @@ Both models run every frame. Results are merged and filtered through `eye_of_bli
 ---
 
 ## Vibration System (Phase 1 — Simulated)
-Printed to terminal as simulation. Phase 2 will wire this to Android Vibrator API.
+Printed to terminal as simulation. Phase 2 will wire to Android Vibrator API.
 
-| Zone | Output |
+| Priority | Terminal Output |
 |---|---|
-| HIGH | 📳📳📳 STRONG VIBRATION |
-| MEDIUM | 📳 LIGHT VIBRATION |
+| HIGH | 📳📳📳 STRONG |
+| MEDIUM | 📳 LIGHT |
 | LOW | (none) |
+
+---
+
+## Deployment
+
+### Local (webcam detection)
+```
+python yolo_detection.py
+```
+- Uses full `opencv-python` for `cv2.imshow` support
+- Press `q` to quit
+
+### Server (Render / Docker)
+```
+docker build -t emboni .
+docker run -p 8000:8000 emboni
+```
+- Uses `opencv-python-headless` (no GUI libs needed)
+- Dockerfile installs: `libglib2.0-0, libsm6, libxext6, libxrender-dev, libxcb1`
+- Port binding via `$PORT` env variable (Render compatible)
+
+### API server locally
+```
+python main.py
+# API available at http://localhost:8000/detect
+```
+
+---
+
+## Dependencies
+
+### requirements.txt
+```
+fastapi
+uvicorn
+python-multipart
+ultralytics
+opencv-python
+onnxruntime
+```
+
+### Dockerfile overrides opencv with headless version for server
 
 ---
 
@@ -125,7 +223,7 @@ python train_model.py
 # Step 2 — Copy best.onnx to root folder
 python export_model.py
 
-# Step 3 — Run the detection engine
+# Step 3 — Run detection
 python yolo_detection.py
 ```
 
@@ -138,22 +236,25 @@ python yolo_detection.py
 
 ---
 
-## Git Branch
-All AI code lives on: `feature-ai-detection`
-Main branch: `main`
+## Git Branches
+- `feature-ai-detection` — all AI development work
+- `main` — stable/deployment branch (Render deploys from here)
 
 ---
 
-## Dependencies
-```
-pip install ultralytics opencv-python pyttsx3
-```
+## Known Issues & Fixes
+| Issue | Fix |
+|---|---|
+| `libxcb.so.1` error on Render | Use `opencv-python-headless` in Docker |
+| `cv2.imshow` crash on headless | Wrapped in `try/except` in `yolo_detection.py` |
+| ONNX model task warning | Expected — model still runs correctly |
+| Low detection confidence | conf=0.2 set for 10-epoch model |
 
 ---
 
 ## Phase 2 Roadmap
-- Wire vibration to Android app via Bluetooth/socket
+- Wire vibration to Android app via Bluetooth/WebSocket
 - Increase training epochs (25–50) for better accuracy
 - Add depth camera or stereo vision for real distance measurement
-- Add threading for parallel model inference to reduce lag
-- Deploy as Flutter mobile app with real-time camera feed
+- Stream video frames from Flutter app to `/detect` endpoint
+- Deploy Flutter mobile app with live camera feed
