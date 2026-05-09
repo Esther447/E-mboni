@@ -6,7 +6,7 @@ import time
 from spatial_engine import (
     RawDetection, process_detections, ALL_OBJECTS
 )
-from memory import MemoryEngine
+from memory import MemoryEngine, MotionState, CrowdDetector
 
 # --- VOICE ENGINE ---
 engine = pyttsx3.init()
@@ -43,6 +43,7 @@ speak("E-mboni started. Camera is ready.")
 print("E-mboni AI Engine started. Camera opened.")
 
 memory = MemoryEngine()
+crowd = CrowdDetector()
 last_spoken_time = 0
 
 while cap.isOpened():
@@ -74,20 +75,41 @@ while cap.isOpened():
 
     payload = process_detections(raw_detections)
 
-    # --- TEMPORAL FILTER: suppress known/stationary objects ---
+    # --- MOTION TRACKING: update area history every frame ---
+    for raw in raw_detections:
+        memory.track(raw.label, raw.norm_x, raw.norm_y, raw.box_area, "")
+
+    # --- TEMPORAL FILTER + MOTION ESCALATION ---
     new_detections = []
     for p in payload:
-        # Find matching raw detection for position data
         raw = next((r for r in raw_detections if r.label == p.object), None)
-        if raw and memory.is_known(p.object, raw.norm_x, raw.norm_y):
-            continue  # already reported at same position — stay silent
-        if raw:
-            memory.remember(p.object, raw.norm_x, raw.norm_y, p.priority)
+        if not raw:
+            continue
+
+        motion = memory.track(raw.label, raw.norm_x, raw.norm_y, raw.box_area, p.priority)
+
+        # Escalate approaching objects to HIGH regardless of original priority
+        if motion == MotionState.APPROACHING:
+            p.priority = "HIGH"
+            p.vibe = "STRONG"
+            p.speech = f"STOP. {p.object} approaching {p.direction}"
+            if p.distance:
+                p.speech += f", {p.distance}"
+
+        # Suppress stationary/retreating known objects
+        if motion in (MotionState.STATIONARY, MotionState.RETREATING):
+            if memory.is_known(p.object, raw.norm_x, raw.norm_y):
+                continue
+
+        memory.remember(p.object, raw.norm_x, raw.norm_y, p.priority)
         new_detections.append(p)
 
     # --- STATE MONITOR: path clear trigger ---
     has_obstacles = any(p.priority in ["HIGH", "MEDIUM"] for p in payload)
     path_clear_msg = memory.check_path_clear(has_obstacles)
+
+    # --- CROWD MODE CHECK (before individual alerts) ---
+    is_crowd, crowd_msg = crowd.evaluate(raw_detections, payload)
 
     # Act on new detections only
     now = time.time()
@@ -100,15 +122,21 @@ while cap.isOpened():
             print(f"📳 {p.vibe} | {p.object} {p.direction}")
 
     if high:
+        # HIGH always bypasses crowd mode
         msg = "STOP. " + ", ".join(p.speech.replace("STOP. ", "") for p in high)
         speak(msg)
         last_spoken_time = now
-    elif medium and (now - last_spoken_time) > 3:
+    elif is_crowd and (now - last_spoken_time) > 5:
+        # Crowd summary replaces individual person alerts
+        print(f"AI Voice [CROWD]: {crowd_msg}")
+        speak(crowd_msg)
+        last_spoken_time = now
+    elif medium and not is_crowd and (now - last_spoken_time) > 3:
         msg = ", ".join(p.speech for p in medium)
         print(f"AI Voice [NAV]: {msg}")
         speak(msg)
         last_spoken_time = now
-    elif low and (now - last_spoken_time) > 8:
+    elif low and not is_crowd and (now - last_spoken_time) > 8:
         msg = ", ".join(p.speech for p in low)
         print(f"AI Voice [UTIL]: {msg}")
         speak(msg)

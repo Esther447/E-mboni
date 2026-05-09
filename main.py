@@ -1,10 +1,13 @@
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
 import cv2
 import numpy as np
 from ultralytics import YOLO
 import uvicorn
-from roles import Role, can_access, get_allowed_api_routes
+from roles import Role, can_access
+from spatial_engine import RawDetection, process_detections, ALL_OBJECTS
 
 app = FastAPI()
 
@@ -18,64 +21,32 @@ app.add_middleware(
 custom_model = YOLO("yolov8n.onnx")
 general_model = YOLO("yolov8n.pt")
 
-DANGER_OBJECTS = [
-    "person", "bicycle", "car", "bus", "truck", "motorcycle",
-    "stair", "traffic cone", "stop sign", "traffic light",
-]
 
-NAVIGATION_OBJECTS = [
-    "door", "sofa", "bed", "dining table", "chair", "potted plant",
-    "refrigerator", "microwave", "oven", "sink", "toilet",
-]
+# --- RESPONSE MODEL ---
+class Detection(BaseModel):
+    object: str
+    direction: str
+    distance: Optional[str]
+    priority: str
+    vibe: Optional[str]
+    vibe_pattern: Optional[str]
+    vertical_zone: Optional[str]
+    speech: str
 
-UTILITY_OBJECTS = [
-    "laptop", "cell phone", "keyboard", "mouse", "remote",
-    "bottle", "cup", "bowl", "spoon", "fork", "knife",
-    "backpack", "suitcase", "umbrella", "book", "handbag",
-    "dog", "cow", "bird", "cat", "horse",
-    "fire hydrant", "parking meter",
-]
-
-eye_of_blind_list = DANGER_OBJECTS + NAVIGATION_OBJECTS + UTILITY_OBJECTS
+class DetectResponse(BaseModel):
+    detections: list[Detection]
 
 
-def get_distance(box_area):
-    if box_area > 150000: return "50 centimeters"
-    elif box_area > 120000: return "1 meter"
-    elif box_area > 60000: return "2 meters"
-    elif box_area > 30000: return "3 to 4 meters"
-    return None
-
-def get_direction(norm_x, norm_y):
-    if norm_y < 0.3:
-        vertical = "high"
-    elif norm_y > 0.7:
-        vertical = "low"
-    else:
-        vertical = None
-
-    if norm_x < 0.2:    horizontal = "to your far left"
-    elif norm_x < 0.4:  horizontal = "on your left"
-    elif norm_x <= 0.6: horizontal = "straight ahead"
-    elif norm_x <= 0.8: horizontal = "on your right"
-    else:               horizontal = "to your far right"
-
-    if vertical:
-        return f"{horizontal}, {vertical}"
-    return horizontal
-
-def get_priority_and_vibe(label, box_area):
-    if label in DANGER_OBJECTS:
-        return "HIGH", "STRONG"
-    elif label in NAVIGATION_OBJECTS and box_area > 60000:
-        return "MEDIUM", "LIGHT"
-    elif label in UTILITY_OBJECTS and box_area > 120000:
-        return "LOW", None
-    return "NONE", None
-
-
-@app.post("/detect")
+# --- DETECT ENDPOINT ---
+@app.post("/detect", response_model=DetectResponse)
 async def detect(file: UploadFile = File(...), x_role: str = Header(default="user")):
+    """
+    Receives an image frame, runs both models, merges results,
+    and returns the single highest-priority detection.
+
+    Priority order: HIGH (stair, person, car...) → MEDIUM (door, chair...) → LOW (bottle, phone...)
+    Role required: user (guardian/admin will receive 403)
+    """
     try:
         role = Role(x_role.lower())
     except ValueError:
@@ -87,55 +58,48 @@ async def detect(file: UploadFile = File(...), x_role: str = Header(default="use
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        raise HTTPException(status_code=400, detail="Invalid image file")
+
     h, w = img.shape[:2]
 
-    results_c = custom_model(img, conf=0.2)
-    results_g = general_model(img, conf=0.25)
+    # Run both models and merge results
+    results_c = custom_model(img, conf=0.2)   # custom: 7 indoor classes
+    results_g = general_model(img, conf=0.25) # general: 80 COCO classes
 
-    payload = []
+    raw_detections = []
     seen_labels = set()
 
     for r in (results_c + results_g):
         for box in r.boxes:
             label = r.names[int(box.cls[0])]
-            if label not in eye_of_blind_list or label in seen_labels:
+            if label not in ALL_OBJECTS or label in seen_labels:
                 continue
-
             x1, y1, x2, y2 = box.xyxy[0]
-            box_area = float((x2 - x1) * (y2 - y1))
-            norm_x = float(((x1 + x2) / 2) / w)
-            norm_y = float(((y1 + y2) / 2) / h)
-
-            priority, vibe = get_priority_and_vibe(label, box_area)
-            if priority == "NONE":
-                continue
-
-            direction = get_direction(norm_x, norm_y)
-
-            distance = get_distance(box_area)
-            dist_str = f", {distance}" if distance else ""
-
-            if priority == "HIGH":
-                speech = f"STOP. {label} {direction}{dist_str}"
-            else:
-                speech = f"{label} {direction}{dist_str}"
-
-            payload.append({
-                "object": label,
-                "direction": direction,
-                "distance": distance,
-                "priority": priority,
-                "vibe": vibe,
-                "speech": speech
-            })
+            raw_detections.append(RawDetection(
+                label=label,
+                box_area=float((x2 - x1) * (y2 - y1)),
+                norm_x=float(((x1 + x2) / 2) / w),
+                norm_y=float(((y1 + y2) / 2) / h),
+            ))
             seen_labels.add(label)
 
-    # Sort by priority: HIGH first, then MEDIUM, then LOW
-    priority_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-    payload.sort(key=lambda x: priority_order.get(x["priority"], 3))
+    # Process, sort by priority, return top 1
+    results = process_detections(raw_detections)
 
-    # Return top detection only to keep voice clean
-    return {"detections": payload[:1]}
+    return DetectResponse(detections=[
+        Detection(
+            object=r.object,
+            direction=r.direction,
+            distance=r.distance,
+            priority=r.priority,
+            vibe=r.vibe,
+            vibe_pattern=r.vibe_pattern,
+            vertical_zone=r.vertical_zone,
+            speech=r.speech,
+        ) for r in results[:1]
+    ])
 
 
 # --- GUARDIAN ENDPOINTS ---
