@@ -38,6 +38,13 @@ UTILITY_OBJECTS = [
 eye_of_blind_list = DANGER_OBJECTS + NAVIGATION_OBJECTS + UTILITY_OBJECTS
 
 
+def get_distance(box_area):
+    if box_area > 150000: return "50 centimeters"
+    elif box_area > 120000: return "1 meter"
+    elif box_area > 60000: return "2 meters"
+    elif box_area > 30000: return "3 to 4 meters"
+    return None
+
 def get_direction(norm_x, norm_y):
     if norm_y < 0.3:
         vertical = "high"
@@ -96,14 +103,18 @@ async def detect(file: UploadFile = File(...)):
 
             direction = get_direction(norm_x, norm_y)
 
+            distance = get_distance(box_area)
+            dist_str = f", {distance}" if distance else ""
+
             if priority == "HIGH":
-                speech = f"STOP. {label} {direction}"
+                speech = f"STOP. {label} {direction}{dist_str}"
             else:
-                speech = f"{label} {direction}"
+                speech = f"{label} {direction}{dist_str}"
 
             payload.append({
                 "object": label,
                 "direction": direction,
+                "distance": distance,
                 "priority": priority,
                 "vibe": vibe,
                 "speech": speech

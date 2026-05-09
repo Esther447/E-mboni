@@ -47,7 +47,14 @@ eye_of_blind_list = DANGER_OBJECTS + NAVIGATION_OBJECTS + UTILITY_OBJECTS
 
 
 # --- HELPER FUNCTIONS ---
-def get_direction(norm_x, norm_y):
+def get_distance(box_area):
+    if box_area > 150000: return "50 centimeters"
+    elif box_area > 120000: return "1 meter"
+    elif box_area > 60000: return "2 meters"
+    elif box_area > 30000: return "3 to 4 meters"
+    return None  # too far, no alert
+
+
     if norm_y < 0.3:
         vertical = "high"
     elif norm_y > 0.7:
@@ -79,13 +86,19 @@ def process_detections(raw_detections):
 
         if priority == "HIGH":
             vibe = "STRONG"
-            speech = f"STOP. {det['label']} {direction}"
+            distance = get_distance(det["box_area"])
+            dist_str = f", {distance}" if distance else ""
+            speech = f"STOP. {det['label']} {direction}{dist_str}"
         elif priority == "MEDIUM" and det["box_area"] > 60000:
             vibe = "LIGHT"
-            speech = f"{det['label']} {direction}"
+            distance = get_distance(det["box_area"])
+            dist_str = f", {distance}" if distance else ""
+            speech = f"{det['label']} {direction}{dist_str}"
         elif priority == "LOW" and det["box_area"] > 120000:
             vibe = None
-            speech = f"{det['label']} {direction}"
+            distance = get_distance(det["box_area"])
+            dist_str = f", {distance}" if distance else ""
+            speech = f"{det['label']} {direction}{dist_str}"
         else:
             continue
 
