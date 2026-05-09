@@ -52,9 +52,9 @@ def get_distance(box_area):
     elif box_area > 120000: return "1 meter"
     elif box_area > 60000: return "2 meters"
     elif box_area > 30000: return "3 to 4 meters"
-    return None  # too far, no alert
+    return None
 
-
+def get_direction(norm_x, norm_y):
     if norm_y < 0.3:
         vertical = "high"
     elif norm_y > 0.7:
@@ -114,6 +114,15 @@ def process_detections(raw_detections):
 
 # --- MAIN LOOP ---
 cap = cv2.VideoCapture(0)
+
+if not cap.isOpened():
+    speak("Camera not found. Please check your camera.")
+    print("ERROR: Could not open camera.")
+    exit(1)
+
+speak("E-mboni started. Camera is ready.")
+print("E-mboni AI Engine started. Camera opened.")
+
 last_spoken_time = 0
 
 while cap.isOpened():
