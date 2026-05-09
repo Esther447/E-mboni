@@ -8,6 +8,7 @@ from ultralytics import YOLO
 import uvicorn
 from roles import Role, can_access
 from spatial_engine import RawDetection, process_detections, ALL_OBJECTS
+from events import event_store
 
 app = FastAPI()
 
@@ -88,6 +89,16 @@ async def detect(file: UploadFile = File(...), x_role: str = Header(default="use
     # Process, sort by priority, return top 1
     results = process_detections(raw_detections)
 
+    # Log HIGH priority detections as safety events — frame is NOT stored
+    for r in results:
+        if r.priority == "HIGH":
+            event_store.log_safety_event(
+                hazard=r.object,
+                direction=r.direction,
+                distance=r.distance
+            )
+            break  # log only the top hazard per frame
+
     return DetectResponse(detections=[
         Detection(
             object=r.object,
@@ -104,40 +115,69 @@ async def detect(file: UploadFile = File(...), x_role: str = Header(default="use
 
 # --- GUARDIAN ENDPOINTS ---
 @app.get("/alerts")
-async def get_alerts(x_role: str = Header(default="guardian")):
+async def get_alerts(x_role: str = Header(default="guardian"),
+                     since: float = 0.0):
     try:
         role = Role(x_role.lower())
     except ValueError:
         raise HTTPException(status_code=403, detail="Invalid role")
     if not can_access(role, "emergency_alerts"):
         raise HTTPException(status_code=403, detail="Access denied")
-    # Returns text-based alerts only — no camera, no location
-    return {"alerts": [], "note": "Text alerts only. No camera or location data."}
+    alerts = event_store.get_guardian_alerts(since=since)
+    return {"alerts": alerts, "note": "Text alerts only. No camera or location data."}
 
 
 @app.get("/location/last-known")
-async def last_known_location(x_role: str = Header(default="guardian")):
+async def last_known_location(user_id: str,
+                               x_role: str = Header(default="guardian")):
     try:
         role = Role(x_role.lower())
     except ValueError:
         raise HTTPException(status_code=403, detail="Invalid role")
     if not can_access(role, "last_known_location"):
         raise HTTPException(status_code=403, detail="Access denied")
-    # Only returned if user has enabled location sharing
-    return {"location": None, "sharing_enabled": False}
+    location = event_store.get_last_known_location(user_id)
+    return {
+        "location": location,
+        "sharing_enabled": location is not None,
+        "note": "Only available if user has enabled location sharing."
+    }
+
+
+# --- USER ENDPOINTS ---
+@app.post("/location/share")
+async def toggle_location_sharing(user_id: str, enabled: bool,
+                                   x_role: str = Header(default="user")):
+    try:
+        role = Role(x_role.lower())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Invalid role")
+    if not can_access(role, "local_settings"):
+        raise HTTPException(status_code=403, detail="Access denied")
+    event_store.enable_location_sharing(user_id, enabled)
+    return {"sharing_enabled": enabled}
 
 
 # --- ADMIN ENDPOINTS ---
 @app.get("/devices/status")
-async def device_status(x_role: str = Header(default="admin")):
+async def device_status(device_id: str,
+                         x_role: str = Header(default="admin")):
     try:
         role = Role(x_role.lower())
     except ValueError:
         raise HTTPException(status_code=403, detail="Invalid role")
     if not can_access(role, "device_management"):
         raise HTTPException(status_code=403, detail="Access denied")
-    # Online/Offline only — no personal data, no location, no camera
-    return {"status": "online", "note": "Device status only. No user data accessible."}
+    status = event_store.get_device_status(device_id)
+    return {"device_id": device_id, "status": status,
+            "note": "Device status only. No user data accessible."}
+
+
+@app.post("/devices/ping")
+async def device_ping(device_id: str, x_role: str = Header(default="user")):
+    """Heartbeat endpoint — keeps device marked as online."""
+    event_store.ping(device_id)
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":
