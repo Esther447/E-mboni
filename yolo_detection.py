@@ -8,6 +8,10 @@ from spatial_engine import (
 )
 from memory import MemoryEngine, MotionState, CrowdDetector
 
+# --- CONFIG ---
+IMGSZ = 320   # Reduced from 640 → doubles inference speed on CPU
+BLIND_ID = 3  # ID of the blind user in the DB (James Kamau = 3)
+
 # --- VOICE ENGINE ---
 engine = pyttsx3.init()
 engine.setProperty('rate', 180)
@@ -23,6 +27,37 @@ def speak(text):
         engine.runAndWait()
         is_speaking = False
     threading.Thread(target=run, daemon=True).start()
+
+# --- ALERT POSTER ---
+# Writes danger alerts directly to the database.
+# Runs in a background thread so it never blocks the camera loop.
+_alert_cooldown: dict[str, float] = {}  # prevent duplicate DB writes
+
+def post_alert(object_name: str, message: str, level: str, blind_id: int = 3):
+    """Insert a danger alert into PostgreSQL in a background thread."""
+    now = time.time()
+    key = f"{object_name}_{level}"
+    # Only write once every 5 seconds per object+level to avoid DB spam
+    if key in _alert_cooldown and (now - _alert_cooldown[key]) < 5.0:
+        return
+    _alert_cooldown[key] = now
+
+    def _write():
+        try:
+            from database import SessionLocal, Alert, AlertLevelEnum
+            db = SessionLocal()
+            db.add(Alert(
+                blind_id=blind_id,
+                message=message,
+                level=AlertLevelEnum(level),
+            ))
+            db.commit()
+            db.close()
+        except Exception as e:
+            print(f"[alert DB error] {e}")
+
+    threading.Thread(target=_write, daemon=True).start()
+
 
 # --- MODELS ---
 custom_model = YOLO("yolov8n.onnx")
@@ -46,14 +81,39 @@ memory = MemoryEngine()
 crowd = CrowdDetector()
 last_spoken_time = 0
 
+# Per-object cooldown tracker — prevents "chatter" in busy environments
+# Key: "object_direction" e.g. "person_right"
+# Value: timestamp of last alert for that object+position
+last_spoken: dict[str, float] = {}
+
+COOLDOWN = {
+    "HIGH":   0.0,   # HIGH danger always speaks — no cooldown
+    "MEDIUM": 3.0,   # Navigation objects: 3 second cooldown
+    "LOW":    8.0,   # Utility objects: 8 second cooldown
+}
+
+
+def should_alert(object_name: str, direction: str, priority: str) -> bool:
+    """Returns True only if enough time has passed since we last alerted
+    for this specific object+position combination."""
+    key = f"{object_name}_{direction}"
+    now = time.time()
+    cooldown = COOLDOWN.get(priority, 3.0)
+    if cooldown == 0.0:
+        return True  # HIGH — always alert
+    if key not in last_spoken or (now - last_spoken[key]) > cooldown:
+        last_spoken[key] = now
+        return True
+    return False
+
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret: break
 
     h, w, _ = frame.shape
 
-    results_c = custom_model(frame, imgsz=640, conf=0.2)
-    results_g = general_model(frame, imgsz=640, conf=0.25)
+    results_c = custom_model(frame, imgsz=IMGSZ, conf=0.2)
+    results_g = general_model(frame, imgsz=IMGSZ, conf=0.25)
 
     # Collect raw detections
     raw_detections = []
@@ -128,29 +188,40 @@ while cap.isOpened():
     # Act on new detections only
     now = time.time()
     high   = [p for p in new_detections if p.priority == "HIGH"]
-    medium = [p for p in new_detections if p.priority == "MEDIUM"]
-    low    = [p for p in new_detections if p.priority == "LOW"]
+    medium = [p for p in new_detections if p.priority == "MEDIUM" and should_alert(p.object, p.direction, "MEDIUM")]
+    low    = [p for p in new_detections if p.priority == "LOW"    and should_alert(p.object, p.direction, "LOW")]
 
     for p in new_detections:
         if p.vibe:
             print(f"📳 {p.vibe} | {p.object} {p.direction}")
 
     if high:
-        # HIGH always bypasses crowd mode
-        msg = "STOP. " + ", ".join(p.speech.replace("STOP. ", "") for p in high)
-        speak(msg)
-        last_spoken_time = now
+        # HIGH always bypasses crowd mode and cooldown
+        alertable_high = [p for p in high if should_alert(p.object, p.direction, "HIGH")]
+        if alertable_high:
+            msg = "STOP. " + ", ".join(p.speech.replace("STOP. ", "") for p in alertable_high)
+            speak(msg)
+            last_spoken_time = now
+            # --- POST TO DATABASE ---
+            for p in alertable_high:
+                print(f"🚨 DANGER logged → DB | {p.object} | {p.speech}")
+                post_alert(
+                    object_name=p.object,
+                    message=p.speech,
+                    level="danger",
+                    blind_id=BLIND_ID,
+                )
     elif is_crowd and (now - last_spoken_time) > 5:
         # Crowd summary replaces individual person alerts
         print(f"AI Voice [CROWD]: {crowd_msg}")
         speak(crowd_msg)
         last_spoken_time = now
-    elif medium and not is_crowd and (now - last_spoken_time) > 3:
+    elif medium and not is_crowd:
         msg = ", ".join(p.speech for p in medium)
         print(f"AI Voice [NAV]: {msg}")
         speak(msg)
         last_spoken_time = now
-    elif low and not is_crowd and (now - last_spoken_time) > 8:
+    elif low and not is_crowd:
         msg = ", ".join(p.speech for p in low)
         print(f"AI Voice [UTIL]: {msg}")
         speak(msg)

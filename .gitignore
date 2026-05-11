@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Database — never commit the real DB file
+*.db
+
+# Logs
+server.log
+*.log
+
+# Environment
+.env
+.venv/
+venv/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

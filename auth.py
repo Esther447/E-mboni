@@ -7,8 +7,13 @@ from jose import JWTError, jwt
 from fastapi import HTTPException, Header
 from sqlalchemy.orm import Session
 from database import User, get_db
+import os
+import secrets
 
-SECRET_KEY = "emboni-secret-key-change-in-production"
+# Load secret from environment variable.
+# If not set, generate a random one for this session (safe for dev).
+# In production: set SECRET_KEY in your environment before starting the server.
+SECRET_KEY = os.getenv("EMBONI_SECRET_KEY", secrets.token_hex(32))
 ALGORITHM  = "HS256"
 TOKEN_EXPIRE_DAYS = 30
 

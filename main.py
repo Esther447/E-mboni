@@ -1,22 +1,26 @@
 """
 main.py — E-mboni FastAPI Backend
-Implements the full contract from Esther.md:
-  /auth/register  /auth/login
-  /detect         (updated to frontend DetectionResult format)
-  /users/*        (admin)
-  /alerts/*       (guardian alert feed)
-  /guardian/*     (guardian dashboard)
-  /session/*      (blind user navigation sessions)
 """
 
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 from sqlalchemy.orm import Session
 from typing import Optional, List
 import cv2
 import numpy as np
-import base64
 import uvicorn
+import logging
+
+# ---------------------------------------------------------------------------
+# Logging — shows every request in terminal during frontend testing
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("emboni")
 
 from ultralytics import YOLO
 
@@ -34,27 +38,65 @@ from models import (
 )
 from spatial_engine import RawDetection, process_detections, ALL_OBJECTS
 from events import event_store
+from memory import CrowdDetector
+from datetime import datetime, timezone
+
+# One crowd detector instance shared across all requests
+_crowd_detector = CrowdDetector()
 
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="E-mboni API", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    logger.info("E-mboni backend started. Database ready.")
+    yield
+
+# ---------------------------------------------------------------------------
+# Swagger metadata — this is what the frontend team sees at /docs
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="E-mboni API",
+    version="1.0.0",
+    description="""
+## E-mboni — AI Mobility Assistant for Visually Impaired Users
+
+This API powers the E-mboni mobile app. It handles:
+- **Authentication** — register and login for guardian + blind user pairs
+- **Detection** — real-time object detection from camera frames
+- **Alerts** — danger alerts saved to database and visible to guardian
+- **Sessions** — navigation session tracking
+- **Guardian Dashboard** — privacy-safe view of blind user activity
+- **Admin** — user management
+
+### How to authenticate
+1. Call `POST /auth/login` with phone + password
+2. Copy the `token` from the response
+3. Click **Authorize** (top right) and enter: `Bearer <token>`
+4. All protected endpoints will now work
+
+### Demo accounts
+| Role | Phone | Password |
+|---|---|---|
+| admin | +250780000000 | admin123 |
+| guardian | +250781000001 | guardian123 |
+| blind | +250781000002 | blind123 |
+    """,
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 custom_model = YOLO("yolov8n.onnx")
 general_model = YOLO("yolov8n.pt")
-
-
-@app.on_event("startup")
-def startup():
-    init_db()
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +126,7 @@ def _require_role(role: RoleEnum):
 # POST /auth/register
 # ---------------------------------------------------------------------------
 
-@app.post("/auth/register", response_model=RegisterResponse, status_code=201)
+@app.post("/auth/register", response_model=RegisterResponse, status_code=201, tags=["Authentication"])
 def register(body: RegisterRequest, db: Session = Depends(get_db)):
     for phone in [body.guardian.phone, body.blind_user.phone]:
         if db.query(User).filter(User.phone == phone).first():
@@ -103,7 +145,7 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
     blind_user = User(
         name=body.blind_user.name,
         phone=body.blind_user.phone,
-        password_hash=hash_password(body.blind_user.phone[-6:]),  # temp password = last 6 digits
+        password_hash=hash_password(body.blind_user.phone[-6:]),
         role=RoleEnum.blind,
         language=body.blind_user.language,
         voice_speed=body.blind_user.voice_speed,
@@ -115,6 +157,7 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
     db.refresh(guardian)
     db.refresh(blind_user)
 
+    logger.info(f"REGISTER | guardian={guardian.phone} blind={blind_user.phone}")
     token = create_token(guardian.id, guardian.role.value)
     return RegisterResponse(
         guardian=UserOut(id=guardian.id, name=guardian.name, phone=guardian.phone, role=guardian.role.value),
@@ -128,12 +171,14 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
 # POST /auth/login
 # ---------------------------------------------------------------------------
 
-@app.post("/auth/login", response_model=LoginResponse)
+@app.post("/auth/login", response_model=LoginResponse, tags=["Authentication"])
 def login(body: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.phone == body.phone).first()
     if not user or not verify_password(body.password, user.password_hash):
+        logger.warning(f"LOGIN FAILED | phone={body.phone}")
         raise HTTPException(status_code=401, detail="Wrong phone or password.")
 
+    logger.info(f"LOGIN OK | phone={user.phone} role={user.role.value}")
     blind_summary = None
     if user.role == RoleEnum.guardian:
         linked = db.query(User).filter(User.guardian_id == user.id).first()
@@ -174,6 +219,9 @@ MEDIUM_DANGER_OBJECTS = {
     "staircase", "stairs", "step",
 }
 
+# Objects that become DANGER at <= 1.5m regardless of category (safety brain rule)
+CRITICAL_CLOSE_OBJECTS = {"car", "stair", "truck", "bus", "motorcycle", "staircase", "stairs"}
+
 DIRECTION_MAP = {
     "to your far left": "left",
     "on your left":     "left",
@@ -194,6 +242,9 @@ def _norm_area_to_meters(norm_area: float) -> float:
 
 
 def _danger_level(name: str, distance: float) -> str:
+    # Safety brain rule: car or stair within 1.5m → always danger, save immediately
+    if name in CRITICAL_CLOSE_OBJECTS and distance <= 1.5:
+        return "danger"
     if name in HIGH_DANGER_OBJECTS:
         return "danger" if distance <= 5 else "warning"
     if name in MEDIUM_DANGER_OBJECTS:
@@ -217,25 +268,70 @@ def _build_summary(objects: list[DetectedObject]) -> str:
     return f"{moving}{top.name}, {top.distanceMeters:.1f} meters {'ahead' if top.direction == 'center' else top.direction}"
 
 
-@app.post("/detect", response_model=DetectionResult)
+def _save_alert(db: Session, blind_id: int, message: str, level: str):
+    """INSERT a danger or warning alert into the alerts table."""
+    db.add(Alert(
+        blind_id=blind_id,
+        message=message,
+        level=AlertLevelEnum(level),
+    ))
+    db.commit()
+
+
+def _last_alert_seconds_ago(db: Session, blind_id: int) -> float:
+    """
+    Returns how many seconds ago the last alert was saved for this blind user.
+    Returns 999 if no alerts exist yet (safe to announce path clear).
+    """
+    last = (
+        db.query(Alert)
+        .filter(Alert.blind_id == blind_id)
+        .order_by(Alert.created_at.desc())
+        .first()
+    )
+    if not last:
+        return 999.0
+    now = datetime.now(timezone.utc)
+    last_time = last.created_at
+    # Make timezone-aware if stored as naive UTC
+    if last_time.tzinfo is None:
+        last_time = last_time.replace(tzinfo=timezone.utc)
+    return (now - last_time).total_seconds()
+
+
+PATH_CLEAR_SILENCE_SECONDS = 5.0  # must be this long since last alert to say "Path clear"
+
+
+@app.post("/detect", response_model=DetectionResult, tags=["Detection"])
 async def detect(
     file: UploadFile = File(None),
     authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ):
-    # Accept both file upload and base64 body (frontend sends base64)
-    if file:
-        contents = await file.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    else:
+    if not file:
         raise HTTPException(status_code=400, detail="No image provided.")
+
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if img is None:
         raise HTTPException(status_code=400, detail="Invalid image file.")
 
     h, w = img.shape[:2]
 
+    # --- Identify the blind user from token (optional) ---
+    blind_user: Optional[User] = None
+    if authorization and authorization.startswith("Bearer "):
+        try:
+            payload = decode_token(authorization.split(" ", 1)[1])
+            u = db.query(User).filter(User.id == int(payload["sub"])).first()
+            if u and u.role == RoleEnum.blind:
+                blind_user = u
+        except Exception:
+            pass
+
+    # --- Run both YOLO models ---
     results_c = custom_model(img, conf=0.2)
     results_g = general_model(img, conf=0.25)
 
@@ -258,29 +354,10 @@ async def detect(
 
     spatial_results = process_detections(raw_detections)
 
-    # Log HIGH priority to event store
-    for r in spatial_results:
-        if r.priority == "HIGH":
-            event_store.log_safety_event(hazard=r.object, direction=r.direction, distance=r.distance)
+    # --- Crowd detection check (runs before individual object logic) ---
+    is_crowd, crowd_message = _crowd_detector.evaluate(raw_detections, spatial_results)
 
-            # Persist alert to DB if we can identify the blind user from token
-            if authorization and authorization.startswith("Bearer "):
-                try:
-                    payload = decode_token(authorization.split(" ", 1)[1])
-                    user = db.query(User).filter(User.id == int(payload["sub"])).first()
-                    if user and user.role == RoleEnum.blind:
-                        level = "danger" if r.priority == "HIGH" else "warning"
-                        db.add(Alert(
-                            blind_id=user.id,
-                            message=r.speech,
-                            level=level,
-                        ))
-                        db.commit()
-                except Exception:
-                    pass
-            break
-
-    # Build frontend-format objects
+    # --- Build frontend-format objects ---
     detected_objects: list[DetectedObject] = []
     for raw, spatial in zip(raw_detections, spatial_results):
         norm_area = raw.box_area / (w * h)
@@ -294,13 +371,42 @@ async def detect(
             dangerLevel=_danger_level(raw.label, dist_m),
         ))
 
-    # Sort by danger level
     danger_order = {"danger": 0, "warning": 1, "safe": 2}
     detected_objects.sort(key=lambda o: danger_order[o.dangerLevel])
 
     top_danger = detected_objects[0].dangerLevel if detected_objects else "safe"
-    summary = _build_summary(detected_objects)
 
+    # --- Save danger/warning alerts to DB ---
+    if blind_user and detected_objects:
+        top = detected_objects[0]
+        if top.dangerLevel in ("danger", "warning"):
+            event_store.log_safety_event(
+                hazard=top.name,
+                direction=top.direction,
+                distance=str(top.distanceMeters),
+            )
+            _save_alert(
+                db=db,
+                blind_id=blind_user.id,
+                message=spatial_results[0].speech if spatial_results else top.name,
+                level=top.dangerLevel,
+            )
+
+    # --- Build summary ---
+    # Crowd mode: collapse individual person alerts into one crowd message
+    if is_crowd and crowd_message:
+        summary = crowd_message
+    elif not detected_objects:
+        # Path clear: only announce if DB confirms silence for 5+ seconds
+        if blind_user:
+            seconds_ago = _last_alert_seconds_ago(db, blind_user.id)
+            summary = "Path clear." if seconds_ago >= PATH_CLEAR_SILENCE_SECONDS else ""
+        else:
+            summary = "Path clear."
+    else:
+        summary = _build_summary(detected_objects)
+
+    logger.info(f"DETECT | user={blind_user.phone if blind_user else 'anonymous'} | topDanger={top_danger} | objects={len(detected_objects)}")
     return DetectionResult(objects=detected_objects, summary=summary, topDanger=top_danger)
 
 
@@ -308,7 +414,7 @@ async def detect(
 # /users/*  — admin only
 # ---------------------------------------------------------------------------
 
-@app.get("/users", response_model=List[UserAdminOut])
+@app.get("/users", response_model=List[UserAdminOut], tags=["Admin"])
 def list_users(
     current_user: User = Depends(_require_role(RoleEnum.admin)),
     db: Session = Depends(get_db),
@@ -316,7 +422,7 @@ def list_users(
     return db.query(User).all()
 
 
-@app.get("/users/{user_id}", response_model=UserAdminOut)
+@app.get("/users/{user_id}", response_model=UserAdminOut, tags=["Admin"])
 def get_user(
     user_id: int,
     current_user: User = Depends(_require_role(RoleEnum.admin)),
@@ -328,7 +434,7 @@ def get_user(
     return user
 
 
-@app.patch("/users/{user_id}/status")
+@app.patch("/users/{user_id}/status", tags=["Admin"])
 def update_user_status(
     user_id: int,
     status: str,
@@ -350,7 +456,7 @@ def update_user_status(
 # /alerts/*  — guardian alert feed
 # ---------------------------------------------------------------------------
 
-@app.get("/alerts", response_model=List[AlertOut])
+@app.get("/alerts", response_model=List[AlertOut], tags=["Alerts"])
 def get_alerts(
     current_user: User = Depends(_require_auth),
     db: Session = Depends(get_db),
@@ -367,7 +473,7 @@ def get_alerts(
     raise HTTPException(status_code=403, detail="Access denied.")
 
 
-@app.get("/alerts/{blind_id}", response_model=List[AlertOut])
+@app.get("/alerts/{blind_id}", response_model=List[AlertOut], tags=["Alerts"])
 def get_alerts_for_blind(
     blind_id: int,
     current_user: User = Depends(_require_role(RoleEnum.admin)),
@@ -380,26 +486,38 @@ def get_alerts_for_blind(
 # /guardian/*  — guardian dashboard
 # ---------------------------------------------------------------------------
 
-@app.get("/guardian/dashboard", response_model=GuardianDashboardOut)
+@app.get("/guardian/dashboard", response_model=GuardianDashboardOut, tags=["Guardian"])
 def guardian_dashboard(
     current_user: User = Depends(_require_role(RoleEnum.guardian)),
     db: Session = Depends(get_db),
 ):
+    # Find the blind user linked to this guardian
     blind = db.query(User).filter(User.guardian_id == current_user.id).first()
     recent_alerts = []
     active_session = None
 
     if blind:
+        # Exact query from spec:
+        # SELECT * FROM alerts
+        # WHERE blind_id IN (SELECT id FROM users WHERE guardian_id = current_guardian_id)
+        # ORDER BY created_at DESC LIMIT 10
+        blind_ids = [
+            row.id for row in
+            db.query(User.id).filter(User.guardian_id == current_user.id).all()
+        ]
         recent_alerts = (
             db.query(Alert)
-            .filter(Alert.blind_id == blind.id)
+            .filter(Alert.blind_id.in_(blind_ids))
             .order_by(Alert.created_at.desc())
-            .limit(20)
+            .limit(10)
             .all()
         )
         active_session = (
             db.query(NavSession)
-            .filter(NavSession.blind_id == blind.id, NavSession.status == SessionStatusEnum.active)
+            .filter(
+                NavSession.blind_id == blind.id,
+                NavSession.status == SessionStatusEnum.active,
+            )
             .first()
         )
 
@@ -415,7 +533,7 @@ def guardian_dashboard(
 # /session/*  — blind user navigation sessions
 # ---------------------------------------------------------------------------
 
-@app.post("/session/start", response_model=SessionOut, status_code=201)
+@app.post("/session/start", response_model=SessionOut, status_code=201, tags=["Sessions"])
 def start_session(
     current_user: User = Depends(_require_role(RoleEnum.blind)),
     db: Session = Depends(get_db),
@@ -437,7 +555,7 @@ def start_session(
     return session
 
 
-@app.post("/session/end", response_model=SessionOut)
+@app.post("/session/end", response_model=SessionOut, tags=["Sessions"])
 def end_session(
     current_user: User = Depends(_require_role(RoleEnum.blind)),
     db: Session = Depends(get_db),
@@ -456,7 +574,7 @@ def end_session(
     return session
 
 
-@app.get("/session/active", response_model=Optional[SessionOut])
+@app.get("/session/active", response_model=Optional[SessionOut], tags=["Sessions"])
 def get_active_session(
     current_user: User = Depends(_require_auth),
     db: Session = Depends(get_db),
@@ -473,7 +591,7 @@ def get_active_session(
     ).first()
 
 
-@app.get("/session/history", response_model=List[SessionOut])
+@app.get("/session/history", response_model=List[SessionOut], tags=["Sessions"])
 def session_history(
     current_user: User = Depends(_require_role(RoleEnum.admin)),
     db: Session = Depends(get_db),
@@ -509,4 +627,4 @@ async def device_ping(device_id: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)

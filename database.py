@@ -1,18 +1,19 @@
 """
-database.py — SQLite database setup with SQLAlchemy ORM.
+database.py — PostgreSQL database setup with SQLAlchemy ORM.
 Tables: users, alerts, sessions
 Seeded with 3 demo accounts from Esther.md spec.
 """
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Enum as SAEnum
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship as orm_relationship
 from datetime import datetime
 import enum
 import bcrypt
 
-DATABASE_URL = "sqlite:///./emboni.db"
+# Replace the values below with your actual PostgreSQL credentials
+DATABASE_URL = "postgresql://postgres:Gervais0790194121@localhost:5432/e-mboni"
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -69,7 +70,7 @@ class User(Base):
     relationship    = Column(String, nullable=True)
     created_at      = Column(DateTime, default=datetime.utcnow)
 
-    blind_users     = relationship("User", foreign_keys=[guardian_id])
+    blind_users     = orm_relationship("User", foreign_keys="[User.guardian_id]")
 
 
 class Alert(Base):
@@ -78,7 +79,7 @@ class Alert(Base):
     id         = Column(Integer, primary_key=True, index=True)
     blind_id   = Column(Integer, ForeignKey("users.id"), nullable=False)
     message    = Column(String, nullable=False)
-    level      = Column(SAEnum(AlertLevelEnum), nullable=False)
+    level      = Column(SAEnum(AlertLevelEnum), nullable=False, default=AlertLevelEnum.warning)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -128,7 +129,7 @@ def init_db():
 def _seed_demo_accounts(db):
     admin = User(
         name="Admin",
-        phone="+250 711 000 000",
+        phone="+250780000000",
         password_hash=hash_password("admin123"),
         role=RoleEnum.admin,
         language=LanguageEnum.en,
@@ -140,7 +141,7 @@ def _seed_demo_accounts(db):
 
     guardian = User(
         name="Sarah Kamau",
-        phone="+250 711 000 001",
+        phone="+250781000001",
         password_hash=hash_password("guardian123"),
         role=RoleEnum.guardian,
         language=LanguageEnum.en,
@@ -153,14 +154,14 @@ def _seed_demo_accounts(db):
 
     blind_user = User(
         name="James Kamau",
-        phone="+250 711 000 002",
+        phone="+250781000002",
         password_hash=hash_password("blind123"),
         role=RoleEnum.blind,
         language=LanguageEnum.en,
         voice_speed=VoiceSpeedEnum.Normal,
         status=StatusEnum.active,
         guardian_id=guardian.id,
-        emergency_phone="+250 700 000 000",
+        emergency_phone="+250780000000",
     )
     db.add(blind_user)
     db.commit()

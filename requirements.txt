@@ -7,3 +7,4 @@ onnxruntime
 sqlalchemy
 bcrypt
 python-jose[cryptography]
+psycopg2-binary

@@ -1,206 +1,357 @@
-# E-mboni AI Engine — Project Documentation
-
-## Overview
-E-mboni is an AI-powered assistive navigation system for visually impaired users.
-It uses a camera to detect objects in real time and provides:
-- Voice alerts (direction + object type)
-- Simulated vibration feedback (to be wired to Android in Phase 2)
-- REST API for frontend (Flutter/Diane's UI) integration
+# E-mboni — Project Documentation
+> Last updated: Phase 2 Complete — Backend fully operational with PostgreSQL.
+> Read this before touching any file.
 
 ---
 
-## Project Structure
+## Current Status — What Is Done Right Now
+
+| Area | Status | Detail |
+|---|---|---|
+| YOLOv8 object detection | ✅ Done | Two models running, merged results |
+| `/detect` frontend format | ✅ Done | Returns `objects`, `summary`, `topDanger` |
+| PostgreSQL connected | ✅ Done | `e-mboni` database on localhost:5432 |
+| `users` table | ✅ Done | 3 demo accounts seeded |
+| `alerts` table | ✅ Done | Auto-saved on danger/warning detection |
+| `sessions` table | ✅ Done | Start/end tracked with timestamps |
+| `POST /auth/register` | ✅ Done | Creates guardian + blind user together |
+| `POST /auth/login` | ✅ Done | Returns JWT token + nested user data |
+| JWT authentication | ✅ Done | 30-day tokens, role-based access |
+| `/guardian/dashboard` | ✅ Done | Privacy-safe subquery, last 10 alerts |
+| `/session/start` `/session/end` | ✅ Done | Blind user navigation sessions |
+| `/users/*` admin endpoints | ✅ Done | List, get, activate/deactivate users |
+| Phone number validation | ✅ Done | Rwandan format only (072/073/078/079) |
+| Bilingual error messages | ✅ Done | English + Kinyarwanda on 422 errors |
+| Anti-chatter cooldown | ✅ Done | Per-object+position cooldown timer |
+| Inference speed | ✅ Done | Reduced imgsz 640→320, ~2x faster |
+| Danger alert → DB | ✅ Done | STRONG vibration triggers DB write |
+| Crowd detection | ✅ Done | 3+ people → crowd summary message |
+| Path clear DB check | ✅ Done | 5s silence rule before announcing clear |
+| Integration tests | ✅ Done | `test_api.py` covers all 6 endpoints |
+| Phone regex tests | ✅ Done | `test_phone.py` covers 15 formats |
+
+### 🔜 Next — Frontend Integration (Phase 3)
+The backend is fully ready. The frontend team can now connect all screens.
+
+---
+
+## Demo Accounts (Live in PostgreSQL)
+
+| Role | Phone | Password | Screen after login |
+|---|---|---|---|
+| admin | +250780000000 | admin123 | Admin dashboard |
+| guardian | +250781000001 | guardian123 | Guardian dashboard |
+| blind | +250781000002 | blind123 | Navigation screen |
+
+---
+
+## Project File Structure
 
 ```
 E-mboni/
-├── yolo_detection.py         # Local real-time detection engine (webcam)
-├── main.py                   # FastAPI server — REST API for frontend
-├── train_model.py            # Fine-tunes YOLOv8 on custom dataset
-├── export_model.py           # Copies best.onnx to root after training
-├── navigation_data.yaml      # Dataset config used for training
-├── data.yaml                 # Original Roboflow dataset config
-├── requirements.txt          # Python dependencies
-├── Dockerfile                # Docker config for Render deployment
-├── yolov8n.onnx              # Custom trained model (7 indoor classes)
-├── yolov8n.pt                # Pretrained general model (80 COCO classes)
-├── train/                    # Training images + labels (from Roboflow)
-├── valid/                    # Validation images + labels
-├── test/                     # Test images + labels
-└── runs/                     # Training output (weights, plots, metrics)
+│
+├── main.py               ← FastAPI server — ALL endpoints live here
+├── database.py           ← PostgreSQL connection, ORM models, seed accounts
+├── auth.py               ← JWT token creation and verification
+├── models.py             ← Pydantic schemas + phone/password validators
+├── spatial_engine.py     ← YOLO bbox → direction, distance, speech
+├── events.py             ← In-memory safety event store
+├── memory.py             ← Anti-chatter, crowd detection, TTC engine
+├── roles.py              ← Role permission definitions
+│
+├── queries/
+│   └── create_tables.sql ← PostgreSQL schema — run once to create all tables
+│
+├── init_db.py            ← Run once to create tables + seed demo accounts
+├── test_api.py           ← Integration tests for all 6 endpoints
+├── test_phone.py         ← Phone regex validation tests (15 cases)
+├── requirements.txt      ← All Python dependencies
+├── Dockerfile            ← Docker config for deployment
+│
+├── yolo_detection.py     ← Local webcam detection engine (dev/testing)
+├── yolov8n.onnx          ← Custom trained model (indoor classes)
+├── yolov8n.pt            ← General pretrained model (80 COCO classes)
+│
+├── train_model.py        ← Fine-tunes YOLOv8 on custom dataset
+├── export_model.py       ← Copies best.onnx to root after training
+│
+├── train/                ← Training images + labels
+├── valid/                ← Validation images + labels
+├── test/                 ← Test images + labels
+└── runs/                 ← Training output (weights, plots, metrics)
 ```
 
 ---
 
-## Models
+## How to Run
 
-### 1. yolov8n.onnx (Custom Model)
-- Fine-tuned on Roboflow Indoor Navigation dataset
-- 10 epochs, CPU (i3), imgsz=640
-- 7 classes: `bed, door, sofa, stair, table, toilet, person`
-- conf=0.2 (low threshold for lightly trained model)
+### Start the server
+```bash
+python main.py
+```
+Server: `http://localhost:8000`
+Swagger docs: `http://localhost:8000/docs`
 
-### 2. yolov8n.pt (General Model)
-- Pretrained YOLOv8 Nano on COCO dataset
-- 80 classes (people, cars, phones, animals, etc.)
-- conf=0.25
-
-Both models run on every frame. Results are merged and filtered through `eye_of_blind_list`.
-
----
-
-## Detection Object List (eye_of_blind_list)
-
-### HIGH Priority — DANGER (any distance → immediate alert)
-| Category | Objects |
-|---|---|
-| Dynamic obstacles | person, bicycle, car, bus, truck, motorcycle |
-| Drop-offs | stair |
-| Street hazards | traffic cone, stop sign, traffic light |
-
-### MEDIUM Priority — NAVIGATION (< 2m → voice + light vibration)
-| Category | Objects |
-|---|---|
-| Entry/exit | door |
-| Large furniture | sofa, bed, dining table, chair |
-| Path clearance | potted plant |
-| Appliances | refrigerator, microwave, oven, sink, toilet |
-
-### LOW Priority — UTILITY (< 1m → voice only, slow cooldown)
-| Category | Objects |
-|---|---|
-| Personal tech | laptop, cell phone, keyboard, mouse, remote |
-| Kitchen/dining | bottle, cup, bowl, spoon, fork, knife |
-| Common items | backpack, suitcase, umbrella, book, handbag |
-| Animals (Rwanda) | dog, cow, bird, cat, horse |
-| Surface dangers | fire hydrant, parking meter |
-
----
-
-## Detection Logic
-
-### Distance Estimation (box area proxy)
-| box_area | Estimated Distance |
-|---|---|
-| > 120000 | ~< 1 metre (VERY CLOSE) |
-| > 60000 | ~< 2 metres (CLOSE) |
-| <= 60000 | FAR |
-
-### Spatial Direction (normalized x-axis)
-| norm_x range | Direction |
-|---|---|
-| 0.00 – 0.33 | on your left |
-| 0.33 – 0.67 | straight ahead |
-| 0.67 – 1.00 | on your right |
-
-### Priority & Feedback Strategy
-| Priority | Distance Gate | Voice | Vibration | Cooldown |
-|---|---|---|---|---|
-| HIGH | any | "STOP. [label] [direction]" | 📳📳📳 STRONG | none |
-| MEDIUM | box_area > 60000 | "[label] [direction]" | 📳 LIGHT | 3 seconds |
-| LOW | box_area > 120000 | "[label] [direction]" | none | 8 seconds |
-
----
-
-## Helper Functions (Frontend-Ready)
-
-```python
-get_direction(norm_x)         # Returns: "on your left" / "straight ahead" / "on your right"
-get_priority(label)           # Returns: "HIGH" / "MEDIUM" / "LOW" / "NONE"
-process_detections(raw_list)  # Returns: JSON payload list
+### Run integration tests (server must be running)
+```bash
+python test_api.py
 ```
 
-### JSON Payload Format (per detection)
-```json
-{
-  "object": "person",
-  "direction": "straight ahead",
-  "priority": "HIGH",
-  "vibe": "STRONG",
-  "speech": "STOP. person straight ahead"
-}
+### Run phone validation tests
+```bash
+python test_phone.py
 ```
 
----
-
-## REST API (main.py)
-
-### Endpoint
-```
-POST /detect
-```
-
-### Request
-- Content-Type: `multipart/form-data`
-- Body: image file (jpg/png)
-
-### Response
-```json
-{
-  "detections": [
-    {
-      "object": "person",
-      "direction": "straight ahead",
-      "priority": "HIGH",
-      "vibe": "STRONG",
-      "speech": "STOP. person straight ahead"
-    }
-  ]
-}
-```
-
-- Returns only the top 1 detection (highest priority) to keep voice clean
-- CORS enabled for all origins — Diane's Flutter frontend can call this directly
-
----
-
-## Voice System
-- Engine: `pyttsx3` (offline, no internet needed)
-- Speed: 180 wpm
-- Non-blocking: runs in a background daemon thread
-- Lock: `is_speaking` flag prevents overlapping speech
-
----
-
-## Vibration System (Phase 1 — Simulated)
-Printed to terminal as simulation. Phase 2 will wire to Android Vibrator API.
-
-| Priority | Terminal Output |
-|---|---|
-| HIGH | 📳📳📳 STRONG |
-| MEDIUM | 📳 LIGHT |
-| LOW | (none) |
-
----
-
-## Deployment
-
-### Local (webcam detection)
-```
+### Run local webcam detection
+```bash
 python yolo_detection.py
 ```
-- Uses full `opencv-python` for `cv2.imshow` support
-- Press `q` to quit
 
-### Server (Render / Docker)
-```
-docker build -t emboni .
-docker run -p 8000:8000 emboni
-```
-- Uses `opencv-python-headless` (no GUI libs needed)
-- Dockerfile installs: `libglib2.0-0, libsm6, libxext6, libxrender-dev, libxcb1`
-- Port binding via `$PORT` env variable (Render compatible)
+---
 
-### API server locally
+## Database — PostgreSQL
+
+**Connection string:**
 ```
-python main.py
-# API available at http://localhost:8000/detect
+postgresql://postgres:<password>@localhost:5432/e-mboni
 ```
+
+### Tables
+
+#### `users`
+| Column | Type | Notes |
+|---|---|---|
+| id | SERIAL | Primary key |
+| name | VARCHAR | Full name |
+| phone | VARCHAR | Unique. Format: `+25078XXXXXXX` or `078XXXXXXX` |
+| password_hash | TEXT | bcrypt hashed |
+| role | ENUM | `blind` / `guardian` / `admin` |
+| language | ENUM | `en` / `rw` |
+| voice_speed | ENUM | `Slow` / `Normal` / `Fast` |
+| status | ENUM | `active` / `inactive` |
+| guardian_id | FK → users | Only for blind users |
+| emergency_phone | VARCHAR | Optional, blind users only |
+| relationship | VARCHAR | Guardian's relationship to blind user |
+| created_at | TIMESTAMP | Auto |
+
+#### `alerts`
+| Column | Type | Notes |
+|---|---|---|
+| id | SERIAL | Primary key |
+| blind_id | FK → users | The blind user who triggered the alert |
+| message | TEXT | e.g. `"STOP. car on your left"` |
+| level | ENUM | `safe` / `warning` / `danger` |
+| created_at | TIMESTAMP | Auto |
+
+#### `sessions`
+| Column | Type | Notes |
+|---|---|---|
+| id | SERIAL | Primary key |
+| blind_id | FK → users | The blind user |
+| started_at | TIMESTAMP | When navigation started |
+| ended_at | TIMESTAMP | Null = session still active |
+| status | ENUM | `active` / `ended` |
+
+---
+
+## Full API Reference
+
+Base URL: `http://localhost:8000`
+
+### `POST /auth/register` — `201`
+Creates a guardian + blind user pair in one call.
+```json
+{
+  "guardian": {
+    "name": "Sarah Kamau",
+    "phone": "+250781000001",
+    "password": "guardian123",
+    "relationship": "Mother"
+  },
+  "blind_user": {
+    "name": "James Kamau",
+    "phone": "+250781000002",
+    "emergency_phone": "+250780000000",
+    "language": "en",
+    "voice_speed": "Normal"
+  }
+}
+```
+
+---
+
+### `POST /auth/login` — `200`
+```json
+{ "phone": "+250781000001", "password": "guardian123" }
+```
+Returns `token` + full user object. Guardian response includes nested `blind_user`.
+
+**Error `401`:** `{ "detail": "Wrong phone or password." }`
+**Error `422`:** Bilingual validation message (phone format or password too short)
+
+---
+
+### `POST /detect` — `200`
+Sends a camera frame, returns detected objects in frontend format.
+
+**Request:** `multipart/form-data` with field `file` (image).
+**Optional header:** `Authorization: Bearer <token>` — if blind user token provided, danger alerts are auto-saved to the `alerts` table.
+
+**Response:**
+```json
+{
+  "objects": [
+    {
+      "name": "car",
+      "isMoving": true,
+      "distanceMeters": 1.0,
+      "direction": "center",
+      "dangerLevel": "danger"
+    }
+  ],
+  "summary": "moving car, 1.0 meters ahead",
+  "topDanger": "danger"
+}
+```
+
+**Danger logic:**
+- `car` or `stair` within 1.5m → always `danger`
+- High danger objects (car, truck, bus...) within 5m → `danger`
+- Medium danger objects (person, bicycle...) within 1.5m → `danger`, within 4m → `warning`
+
+---
+
+### `GET /guardian/dashboard` — `200`
+**Auth:** Bearer token (guardian role)
+
+Returns guardian info, linked blind user, last 10 alerts, active session.
+Uses privacy-safe subquery — guardian only sees their own linked user's data.
+
+```json
+{
+  "guardian": { "id": 2, "name": "Sarah Kamau", ... },
+  "blind_user": { "id": 3, "name": "James Kamau", ... },
+  "recent_alerts": [],
+  "active_session": {
+    "id": 1,
+    "blind_id": 3,
+    "started_at": "2026-05-09T17:12:53",
+    "ended_at": null,
+    "status": "active"
+  }
+}
+```
+
+---
+
+### `POST /session/start` — `201`
+**Auth:** Bearer token (blind role)
+Starts a new navigation session. Auto-ends any previously active session.
+
+### `POST /session/end` — `200`
+**Auth:** Bearer token (blind role)
+Ends the current active session, sets `ended_at` timestamp.
+
+### `GET /session/active` — `200`
+**Auth:** Bearer token (blind or guardian)
+Returns the active session or `null`.
+
+### `GET /session/history` — `200`
+**Auth:** Bearer token (admin only). Returns last 100 sessions.
+
+---
+
+### `GET /alerts` — `200`
+**Auth:** Bearer token (guardian or admin)
+- Guardian → sees only their linked blind user's alerts
+- Admin → sees all alerts
+
+### `GET /alerts/{blind_id}` — `200`
+**Auth:** Bearer token (admin only). All alerts for one blind user.
+
+---
+
+### `GET /users` — `200`
+**Auth:** Bearer token (admin only). All users.
+
+### `GET /users/{user_id}` — `200`
+**Auth:** Bearer token (admin only). One user.
+
+### `PATCH /users/{user_id}/status?status=inactive` — `200`
+**Auth:** Bearer token (admin only). Activate or deactivate a user.
+
+---
+
+## Phone Number Validation
+
+Accepted formats:
+```
++250780000000   international MTN
++250790000000   international Airtel
++250720000000   international MTN
++250730000000   international Airtel
+0780000000      local 10 digits
+0790000000      local 10 digits
+0720000000      local 10 digits
+0730000000      local 10 digits
+```
+
+Rejected:
+```
+0711234567      invalid prefix (71)
+078123456       too short (9 digits)
+07812345678     too long (11 digits)
+0788000000      ✅ valid (prefix 78, 10 digits)
+```
+
+Error message (bilingual):
+```
+Inomero ya telefoni ntabwo ari yo / Phone number is invalid.
+Use +25078XXXXXXX or 078XXXXXXX (10 digits)
+```
+
+---
+
+## Detection Engine
+
+### Two models run on every frame
+| Model | File | imgsz | Classes |
+|---|---|---|---|
+| Custom (indoor) | `yolov8n.onnx` | 320 | bed, door, sofa, stair, table, toilet, person |
+| General (COCO) | `yolov8n.pt` | 320 | 80 classes — cars, people, animals, etc. |
+
+> imgsz reduced from 640 to 320 — doubles CPU inference speed (~50–150ms per frame)
+
+### Anti-chatter cooldown (per object+position)
+| Priority | Cooldown | Reason |
+|---|---|---|
+| HIGH (car, stair) | 0s — always speaks | Safety critical |
+| MEDIUM (person, chair) | 3s per position | Prevents "person right... person right..." |
+| LOW (sink, bottle) | 8s per position | Background objects |
+
+### Danger → Database pipeline
+When a STRONG vibration is triggered (HIGH priority object detected):
+1. `speak()` fires the voice alert immediately
+2. `post_alert()` runs in a background thread
+3. Alert is written to `alerts` table in PostgreSQL
+4. Guardian sees it in real time via `GET /guardian/dashboard`
+
+### Crowd detection
+When 3+ people are detected within ~2m:
+- Individual "person ahead" alerts are collapsed
+- Single summary: `"Crowd ahead, navigate right. 3 people within 2 meters."`
+- HIGH hazards (car, stair) always bypass crowd mode
+
+### Path clear rule
+Before announcing "Path clear":
+- Must have 10 consecutive clean frames (no HIGH/MEDIUM objects)
+- AND last alert in DB must be 5+ seconds ago
+- Prevents false "path clear" announcements in busy areas
 
 ---
 
 ## Dependencies
 
-### requirements.txt
 ```
 fastapi
 uvicorn
@@ -208,53 +359,51 @@ python-multipart
 ultralytics
 opencv-python
 onnxruntime
+sqlalchemy
+bcrypt
+python-jose[cryptography]
+psycopg2-binary
 ```
-
-### Dockerfile overrides opencv with headless version for server
 
 ---
 
-## Training Workflow
+## Authentication Flow
 
 ```
-# Step 1 — Train the model
-python train_model.py
-
-# Step 2 — Copy best.onnx to root folder
-python export_model.py
-
-# Step 3 — Run detection
-python yolo_detection.py
+1. Frontend calls POST /auth/login
+2. Backend verifies phone + bcrypt password
+3. Returns JWT token (expires in 30 days)
+4. Frontend stores token
+5. Every protected request sends: Authorization: Bearer <token>
+6. Backend decodes token → finds user → checks role
+7. Wrong role → 403 Access denied
 ```
-
-### Training Config (navigation_data.yaml)
-- Dataset: Roboflow Indoor Navigation (Public Domain)
-- Classes: bed, door, sofa, stair, table, toilet, person
-- Epochs: 10 (hackathon demo)
-- Device: CPU
-- Export: ONNX format
 
 ---
 
-## Git Branches
-- `feature-ai-detection` — all AI development work
-- `main` — stable/deployment branch (Render deploys from here)
+## Known Issues
 
----
-
-## Known Issues & Fixes
 | Issue | Fix |
 |---|---|
 | `libxcb.so.1` error on Render | Use `opencv-python-headless` in Docker |
-| `cv2.imshow` crash on headless | Wrapped in `try/except` in `yolo_detection.py` |
-| ONNX model task warning | Expected — model still runs correctly |
-| Low detection confidence | conf=0.2 set for 10-epoch model |
+| ONNX model task warning on load | Expected — model still runs correctly |
+| Low detection confidence | `conf=0.2` set intentionally for 10-epoch model |
+| Port 10048 already in use | Run: `netstat -aon \| findstr :8000` then `taskkill /PID <id> /F` |
 
 ---
 
-## Phase 2 Roadmap
-- Wire vibration to Android app via Bluetooth/WebSocket
-- Increase training epochs (25–50) for better accuracy
-- Add depth camera or stereo vision for real distance measurement
-- Stream video frames from Flutter app to `/detect` endpoint
-- Deploy Flutter mobile app with live camera feed
+## Roadmap
+
+### Phase 3 — Frontend Connection (Next)
+- Login screen → `POST /auth/login`
+- Blind user camera screen → `POST /detect` with Bearer token
+- Guardian screen → `GET /guardian/dashboard` (poll every 5s)
+- Admin screen → `GET /users` + `GET /alerts`
+- Session auto-start when blind user opens navigation screen
+
+### Phase 4 — Production Deployment
+- Deploy to Render / Railway with PostgreSQL add-on
+- Increase YOLO training epochs (25–50) for better accuracy
+- Add real distance measurement (depth camera or stereo vision)
+- Wire vibration patterns to Android Vibrator API
+- Add push notifications to guardian on danger alerts
