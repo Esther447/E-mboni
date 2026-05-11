@@ -246,6 +246,42 @@ class MemoryEngine:
 
 
 # ---------------------------------------------------------------------------
+# Consistency Filter — object must appear in N consecutive frames to be reported
+# ---------------------------------------------------------------------------
+
+CONSISTENCY_REQUIRED = 2  # frames an object must appear in a row before alerting
+
+
+class ConsistencyFilter:
+    """
+    Prevents one-frame ghost detections from triggering alerts.
+    An object is only "confirmed" after appearing in CONSISTENCY_REQUIRED
+    consecutive frames. Resets counter if object disappears for a frame.
+    """
+
+    def __init__(self):
+        self._streak: dict[str, int] = {}   # label → consecutive frame count
+        self._seen_this_frame: set[str] = set()
+
+    def update(self, detected_labels: list[str]):
+        """Call once per frame with the list of detected labels."""
+        current = set(detected_labels)
+
+        # Increment streak for seen objects, reset for missing ones
+        for label in current:
+            self._streak[label] = self._streak.get(label, 0) + 1
+        for label in list(self._streak):
+            if label not in current:
+                self._streak[label] = 0
+
+        self._seen_this_frame = current
+
+    def is_confirmed(self, label: str) -> bool:
+        """Returns True only if object has appeared CONSISTENCY_REQUIRED frames in a row."""
+        return self._streak.get(label, 0) >= CONSISTENCY_REQUIRED
+
+
+# ---------------------------------------------------------------------------
 # Crowd Detector
 # ---------------------------------------------------------------------------
 

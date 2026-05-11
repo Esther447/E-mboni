@@ -38,11 +38,12 @@ from models import (
 )
 from spatial_engine import RawDetection, process_detections, ALL_OBJECTS
 from events import event_store
-from memory import CrowdDetector
+from memory import CrowdDetector, ConsistencyFilter
 from datetime import datetime, timezone
 
-# One crowd detector instance shared across all requests
+# One crowd detector and one consistency filter shared across all requests
 _crowd_detector = CrowdDetector()
+_consistency = ConsistencyFilter()
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -332,8 +333,8 @@ async def detect(
             pass
 
     # --- Run both YOLO models ---
-    results_c = custom_model(img, conf=0.2)
-    results_g = general_model(img, conf=0.25)
+    results_c = custom_model(img, conf=0.6)
+    results_g = general_model(img, conf=0.6)
 
     raw_detections: list[RawDetection] = []
     seen_labels: set[str] = set()
@@ -354,12 +355,22 @@ async def detect(
 
     spatial_results = process_detections(raw_detections)
 
+    # --- CONSISTENCY FILTER: only report objects seen 2+ frames in a row ---
+    _consistency.update([r.label for r in raw_detections])
+    raw_detections = [r for r in raw_detections if _consistency.is_confirmed(r.label)]
+    spatial_results = [s for s in spatial_results if _consistency.is_confirmed(s.object)]
+
     # --- Crowd detection check (runs before individual object logic) ---
     is_crowd, crowd_message = _crowd_detector.evaluate(raw_detections, spatial_results)
 
     # --- Build frontend-format objects ---
+    # Use spatial_results (already filtered + sorted) and look up matching raw by label
+    raw_by_label = {r.label: r for r in raw_detections}
     detected_objects: list[DetectedObject] = []
-    for raw, spatial in zip(raw_detections, spatial_results):
+    for spatial in spatial_results:
+        raw = raw_by_label.get(spatial.object)
+        if not raw:
+            continue
         norm_area = raw.box_area / (w * h)
         dist_m = _norm_area_to_meters(norm_area)
         direction = _map_direction(spatial.direction)
@@ -385,10 +396,11 @@ async def detect(
                 direction=top.direction,
                 distance=str(top.distanceMeters),
             )
+            top_spatial = next((s for s in spatial_results if s.object == top.name), None)
             _save_alert(
                 db=db,
                 blind_id=blind_user.id,
-                message=spatial_results[0].speech if spatial_results else top.name,
+                message=top_spatial.speech if top_spatial else top.name,
                 level=top.dangerLevel,
             )
 

@@ -13,21 +13,16 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 DANGER_OBJECTS = [
-    "person", "bicycle", "car", "bus", "truck", "motorcycle",
-    "stair", "traffic cone", "stop sign", "traffic light",
+    "person", "car", "bus", "truck", "motorcycle", "bicycle",
+    "stair", "traffic light",
 ]
 
 NAVIGATION_OBJECTS = [
-    "door", "sofa", "bed", "dining table", "chair", "potted plant",
-    "refrigerator", "microwave", "oven", "sink", "toilet",
+    "chair", "dining table", "door", "sofa", "bed", "toilet",
 ]
 
 UTILITY_OBJECTS = [
-    "laptop", "cell phone", "keyboard", "mouse", "remote",
-    "bottle", "cup", "bowl", "spoon", "fork", "knife",
-    "backpack", "suitcase", "umbrella", "book", "handbag",
-    "dog", "cow", "bird", "cat", "horse",
-    "fire hydrant", "parking meter",
+    "backpack", "suitcase", "dog", "cat", "fire hydrant",
 ]
 
 ALL_OBJECTS = DANGER_OBJECTS + NAVIGATION_OBJECTS + UTILITY_OBJECTS

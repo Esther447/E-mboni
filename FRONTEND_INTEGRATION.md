@@ -27,9 +27,8 @@ You need PostgreSQL installed and running on your machine.
 ### 1.4 Set your database password
 Open `database.py` and find this line:
 ```python
-DATABASE_URL = "postgresql://postgres:YOUR_PASSWORD@localhost:5432/e-mboni"
-```
-Replace `YOUR_PASSWORD` with your PostgreSQL password.
+DATABASE_URL = "postgresql://postgres:Gervais0790194121  x@localhost:5432/e-mboni"
+``` 
 
 ### 1.5 Start the backend server
 ```bash

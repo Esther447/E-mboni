@@ -6,10 +6,11 @@ import time
 from spatial_engine import (
     RawDetection, process_detections, ALL_OBJECTS
 )
-from memory import MemoryEngine, MotionState, CrowdDetector
+from memory import MemoryEngine, MotionState, CrowdDetector, ConsistencyFilter
 
 # --- CONFIG ---
-IMGSZ = 320   # Reduced from 640 → doubles inference speed on CPU
+IMGSZ_ONNX = 640  # ONNX model is fixed at 640x640 (exported size)
+IMGSZ_PT   = 320  # .pt model is flexible — use 320 for speed on CPU
 BLIND_ID = 3  # ID of the blind user in the DB (James Kamau = 3)
 
 # --- VOICE ENGINE ---
@@ -79,6 +80,7 @@ print("E-mboni AI Engine started. Camera opened.")
 
 memory = MemoryEngine()
 crowd = CrowdDetector()
+consistency = ConsistencyFilter()
 last_spoken_time = 0
 
 # Per-object cooldown tracker — prevents "chatter" in busy environments
@@ -112,8 +114,8 @@ while cap.isOpened():
 
     h, w, _ = frame.shape
 
-    results_c = custom_model(frame, imgsz=IMGSZ, conf=0.2)
-    results_g = general_model(frame, imgsz=IMGSZ, conf=0.25)
+    results_c = custom_model(frame, imgsz=IMGSZ_ONNX, conf=0.6)
+    results_g = general_model(frame, imgsz=IMGSZ_PT,   conf=0.6)
 
     # Collect raw detections
     raw_detections = []
@@ -134,6 +136,11 @@ while cap.isOpened():
             seen_labels.add(label)
 
     payload = process_detections(raw_detections)
+
+    # --- CONSISTENCY FILTER: only keep objects seen 2+ frames in a row ---
+    consistency.update([r.label for r in raw_detections])
+    raw_detections = [r for r in raw_detections if consistency.is_confirmed(r.label)]
+    payload = [p for p in payload if consistency.is_confirmed(p.object)]
 
     # --- VIBRATION LOCK: bottom zone ground hazards (Rwanda terrain) ---
     memory.update_vibe_lock(raw_detections)
