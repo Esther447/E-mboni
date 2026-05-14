@@ -96,8 +96,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-custom_model = YOLO("yolov8n.onnx")
-general_model = YOLO("yolov8n.pt")
+custom_model = YOLO("yolov8n.onnx", task="detect")
+general_model = YOLO("yolov8n.pt",   task="detect")
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +150,7 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
         role=RoleEnum.blind,
         language=body.blind_user.language,
         voice_speed=body.blind_user.voice_speed,
-        emergency_phone=body.blind_user.emergency_phone,
+        emergency_phone=guardian.phone,
         guardian_id=guardian.id,
     )
     db.add(blind_user)
@@ -305,19 +305,19 @@ PATH_CLEAR_SILENCE_SECONDS = 5.0  # must be this long since last alert to say "P
 
 @app.post("/detect", response_model=DetectionResult, tags=["Detection"])
 async def detect(
-    file: UploadFile = File(None),
+    file: UploadFile = File(...),
     authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ):
-    if not file:
-        raise HTTPException(status_code=400, detail="No image provided.")
-
     contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty image file received.")
+
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if img is None:
-        raise HTTPException(status_code=400, detail="Invalid image file.")
+        raise HTTPException(status_code=400, detail="Could not decode image. Send a valid JPEG.")
 
     h, w = img.shape[:2]
 
@@ -420,6 +420,25 @@ async def detect(
 
     logger.info(f"DETECT | user={blind_user.phone if blind_user else 'anonymous'} | topDanger={top_danger} | objects={len(detected_objects)}")
     return DetectionResult(objects=detected_objects, summary=summary, topDanger=top_danger)
+
+
+# ---------------------------------------------------------------------------
+# GET /auth/me  — current logged-in user profile
+# ---------------------------------------------------------------------------
+
+@app.get("/auth/me", tags=["Authentication"])
+def get_me(current_user: User = Depends(_require_auth)):
+    return {
+        "id":              current_user.id,
+        "name":            current_user.name,
+        "phone":           current_user.phone,
+        "role":            current_user.role.value,
+        "language":        current_user.language.value,
+        "voice_speed":     current_user.voice_speed.value,
+        "status":          current_user.status.value,
+        "emergency_phone": current_user.emergency_phone,
+        "guardian_id":     current_user.guardian_id,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +655,70 @@ async def device_status(device_id: str):
 async def device_ping(device_id: str):
     event_store.ping(device_id)
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# /guardian/tracking  — real timeline + session stats
+# ---------------------------------------------------------------------------
+
+@app.get("/guardian/tracking", tags=["Guardian"])
+def guardian_tracking(
+    current_user: User = Depends(_require_role(RoleEnum.guardian)),
+    db: Session = Depends(get_db),
+):
+    blind = db.query(User).filter(User.guardian_id == current_user.id).first()
+    if not blind:
+        return {"timeline": [], "session": {"status": "No blind user", "duration_minutes": 0, "alert_count": 0}, "blind_name": ""}
+
+    alerts = (
+        db.query(Alert)
+        .filter(Alert.blind_id == blind.id)
+        .order_by(Alert.created_at.desc())
+        .limit(20)
+        .all()
+    )
+
+    active_session = (
+        db.query(NavSession)
+        .filter(NavSession.blind_id == blind.id, NavSession.status == SessionStatusEnum.active)
+        .first()
+    )
+
+    duration = 0
+    if active_session:
+        now = datetime.now(timezone.utc)
+        started = active_session.started_at
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        duration = int((now - started).total_seconds() / 60)
+
+    top_level = "Safe"
+    if alerts:
+        if alerts[0].level.value == "danger":
+            top_level = "Danger"
+        elif alerts[0].level.value == "warning":
+            top_level = "Warning"
+
+    timeline = [
+        {
+            "time": a.created_at.strftime("%H:%M"),
+            "event": a.message,
+            "level": a.level.value,
+        }
+        for a in alerts
+    ]
+
+    return {
+        "blind_name": blind.name,
+        "blind_phone": blind.phone,
+        "is_scanning": active_session is not None,
+        "timeline": timeline,
+        "session": {
+            "status": top_level,
+            "duration_minutes": duration,
+            "alert_count": len(alerts),
+        },
+    }
 
 
 if __name__ == "__main__":

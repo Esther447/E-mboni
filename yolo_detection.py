@@ -61,8 +61,8 @@ def post_alert(object_name: str, message: str, level: str, blind_id: int = 3):
 
 
 # --- MODELS ---
-custom_model = YOLO("yolov8n.onnx")
-general_model = YOLO("yolov8n.pt")
+custom_model = YOLO("yolov8n.onnx", task="detect")
+general_model = YOLO("yolov8n.pt",   task="detect")
 
 eye_of_blind_list = ALL_OBJECTS
 

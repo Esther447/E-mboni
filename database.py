@@ -9,9 +9,12 @@ from sqlalchemy.orm import declarative_base, sessionmaker, relationship as orm_r
 from datetime import datetime
 import enum
 import bcrypt
+import os
+from dotenv import load_dotenv
 
-# Replace the values below with your actual PostgreSQL credentials
-DATABASE_URL = "postgresql://postgres:Gervais0790194121@localhost:5432/e-mboni"
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./emboni.db")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -110,7 +113,7 @@ def get_db():
 # ---------------------------------------------------------------------------
 
 def hash_password(plain: str) -> str:
-    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt(rounds=10)).decode()
 
 def verify_password(plain: str, hashed: str) -> bool:
     return bcrypt.checkpw(plain.encode(), hashed.encode())
@@ -118,50 +121,3 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 def init_db():
     Base.metadata.create_all(bind=engine)
-    db = SessionLocal()
-    try:
-        if db.query(User).count() == 0:
-            _seed_demo_accounts(db)
-    finally:
-        db.close()
-
-
-def _seed_demo_accounts(db):
-    admin = User(
-        name="Admin",
-        phone="+250780000000",
-        password_hash=hash_password("admin123"),
-        role=RoleEnum.admin,
-        language=LanguageEnum.en,
-        voice_speed=VoiceSpeedEnum.Normal,
-        status=StatusEnum.active,
-    )
-    db.add(admin)
-    db.flush()
-
-    guardian = User(
-        name="Sarah Kamau",
-        phone="+250781000001",
-        password_hash=hash_password("guardian123"),
-        role=RoleEnum.guardian,
-        language=LanguageEnum.en,
-        voice_speed=VoiceSpeedEnum.Normal,
-        status=StatusEnum.active,
-        relationship="Mother",
-    )
-    db.add(guardian)
-    db.flush()
-
-    blind_user = User(
-        name="James Kamau",
-        phone="+250781000002",
-        password_hash=hash_password("blind123"),
-        role=RoleEnum.blind,
-        language=LanguageEnum.en,
-        voice_speed=VoiceSpeedEnum.Normal,
-        status=StatusEnum.active,
-        guardian_id=guardian.id,
-        emergency_phone="+250780000000",
-    )
-    db.add(blind_user)
-    db.commit()

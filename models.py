@@ -61,7 +61,6 @@ class GuardianRegisterIn(BaseModel):
 class BlindRegisterIn(BaseModel):
     name: str = Field(..., min_length=2, description="Full name of the blind user")
     phone: str = Field(..., description="Rwandan phone: +25078XXXXXXX or 078XXXXXXX")
-    emergency_phone: Optional[str] = Field(None, description="Emergency contact phone number")
     language: Literal["en", "rw"] = Field("en", description="Preferred language: en or rw")
     voice_speed: Literal["Slow", "Normal", "Fast"] = Field("Normal", description="Voice alert speed")
 
@@ -75,13 +74,6 @@ class BlindRegisterIn(BaseModel):
         if len(v.strip()) < 2:
             raise ValueError("Izina rigomba kuba rifite inyuguti 2 nibura / Name must be at least 2 characters.")
         return v.strip()
-
-    @field_validator("emergency_phone")
-    @classmethod
-    def validate_emergency_phone(cls, v):
-        if v is not None:
-            return _validate_phone(v)
-        return v
 
 class RegisterRequest(BaseModel):
     guardian: GuardianRegisterIn
