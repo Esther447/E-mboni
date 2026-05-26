@@ -735,3 +735,6 @@ Danger:      #F87171
 - [ ] `POST /session/alert` — log a detection alert
 - [ ] JWT middleware protecting all non-auth routes
 - [ ] DB seeded with 3 demo accounts (guardian, blind, admin)
+
+
+## Something to guide you!
