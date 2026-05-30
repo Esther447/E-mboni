@@ -38,6 +38,8 @@ class RawDetection:
     box_area: float   # pixel area: (x2-x1) * (y2-y1)
     norm_x: float     # normalized center x: 0.0 (left) → 1.0 (right)
     norm_y: float     # normalized center y: 0.0 (top)  → 1.0 (bottom)
+    box_w: float = 0.0  # bounding box width in pixels
+    box_h: float = 0.0  # bounding box height in pixels
 
 @dataclass
 class DetectionResult:
@@ -169,8 +171,22 @@ def get_vibe_pattern(label: str, vertical_zone: Optional[str], priority: str) ->
     return None, None
 
 
+# Aspect ratio threshold: height/width ratio below this = sitting/crouching
+# Standing person is tall (ratio > 1.8), sitting is more square (ratio < 1.4)
+SITTING_RATIO = 1.4
+
+
+def get_person_posture(box_w: float, box_h: float) -> str:
+    """Returns 'sitting' or 'standing' based on bounding box aspect ratio."""
+    if box_w == 0:
+        return "standing"
+    ratio = box_h / box_w
+    return "sitting" if ratio < SITTING_RATIO else "standing"
+
+
 def build_vertical_speech(label: str, horizontal: str, vertical_zone: Optional[str],
-                          distance: Optional[str], priority: str) -> str:
+                          distance: Optional[str], priority: str,
+                          box_w: float = 0.0, box_h: float = 0.0) -> str:
     """Builds terrain-aware speech with specific warnings for stairs and overhangs."""
     dist_str = f", {distance}" if distance else ""
 
@@ -182,6 +198,14 @@ def build_vertical_speech(label: str, horizontal: str, vertical_zone: Optional[s
 
     if vertical_zone == OVERHANG:
         return f"Overhead obstacle {horizontal}{dist_str}. Duck or move aside."
+
+    # Person: use posture to give accurate description
+    if label == "person" and box_w > 0:
+        posture = get_person_posture(box_w, box_h)
+        direction = f"{horizontal}, {'low' if vertical_zone == GROUND_LEVEL else 'high'}" if vertical_zone else horizontal
+        if priority == "HIGH":
+            return f"STOP. {posture} person {direction}{dist_str}"
+        return f"{posture} person {direction}{dist_str}"
 
     direction = f"{horizontal}, {'low' if vertical_zone == GROUND_LEVEL else 'high'}" if vertical_zone else horizontal
     if priority == "HIGH":
@@ -249,7 +273,8 @@ def process_detections(raw_detections: list[RawDetection]) -> list[DetectionResu
         vertical_zone = get_vertical_zone(det.norm_y)
         distance      = get_distance(det.box_area)
         vibe, vibe_pattern = get_vibe_pattern(det.label, vertical_zone, priority)
-        speech        = build_vertical_speech(det.label, horizontal, vertical_zone, distance, priority)
+        speech        = build_vertical_speech(det.label, horizontal, vertical_zone, distance, priority,
+                                              box_w=det.box_w, box_h=det.box_h)
 
         results.append(DetectionResult(
             object=det.label,

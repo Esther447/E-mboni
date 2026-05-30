@@ -132,6 +132,8 @@ while cap.isOpened():
                 box_area=float((x2 - x1) * (y2 - y1)),
                 norm_x=float(((x1 + x2) / 2) / w),
                 norm_y=float(((y1 + y2) / 2) / h),
+                box_w=float(x2 - x1),
+                box_h=float(y2 - y1),
             ))
             seen_labels.add(label)
 
