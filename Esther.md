@@ -1,740 +1,678 @@
-# Esther — E-mboni Backend Specification
-> Full backend contract for the E-mboni AI Mobility Assistant.
-> Every detail here is derived directly from the existing frontend code.
-> Build this backend and the frontend will connect without errors.
+# E-mboni — Complete Developer Guide
+> Read this entire file before touching anything in this project.
+> Written for a new developer who has never seen this codebase.
 
 ---
 
-## 1. Project Overview
+## What Is This Project?
 
-**App name:** E-mboni  
-**Version:** 1.0.0  
-**Purpose:** AI-powered assistive navigation for visually impaired users.  
-**Frontend stack:** React Native (Expo), TypeScript, expo-router  
-**Backend stack:** Python + FastAPI (already started in `E-mboni/main.py`)  
-**Languages supported:** English (`en`) and Kinyarwanda (`rw`)
+E-mboni is an AI-powered navigation assistant for visually impaired people in Rwanda.
+
+A blind user holds their phone in front of them while walking. The app captures camera frames, sends them to this backend, and the backend detects obstacles (cars, stairs, people, chairs, etc.) using two YOLO models + a MiDaS depth model. The backend responds with structured JSON that tells the app what to speak aloud and whether to vibrate.
+
+There is also a **guardian** (caregiver/parent) who gets a live alert dashboard to monitor their blind user from their own phone.
+
+**What the blind user hears:** "moving car, 3.5 meters ahead" or "stairs below, watch your step."
 
 ---
 
-## 2. Architecture Summary
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Backend | Python 3.12 + FastAPI |
+| Database | SQLite (local dev) or PostgreSQL (production) |
+| ORM | SQLAlchemy |
+| Auth | JWT tokens via python-jose (30-day expiry) |
+| AI — object detection | YOLOv8 (two models run on every frame) |
+| AI — depth estimation | MiDaS (blended with bbox for distance accuracy) |
+| Frontend | React Native + Expo (separate repo, NOT in this folder) |
+
+---
+
+## Project File Structure
 
 ```
-Mobile App (React Native)
+E-mboni/
+│
+├── main.py              ← THE server. Every API endpoint is here.
+├── database.py          ← DB connection + all ORM table models
+├── auth.py              ← JWT create/decode
+├── models.py            ← Pydantic request/response schemas + phone validation
+├── spatial_engine.py    ← YOLO bbox → direction + distance + speech text
+├── memory.py            ← Consistency filter, crowd detector, motion/TTC engine
+├── events.py            ← Privacy-safe in-memory safety event store
+├── roles.py             ← Role permission definitions
+│
+├── queries/
+│   └── create_tables.sql  ← Raw SQL schema for PostgreSQL (run once)
+│
+├── init_db.py           ← Run once to create tables + seed 3 demo accounts
+├── test_api.py          ← Integration tests for all endpoints
+├── test_phone.py        ← Phone number format validation tests
+├── requirements.txt     ← All Python dependencies
+├── Dockerfile           ← Docker config for deployment
+├── .env                 ← Local config (DATABASE_URL + SECRET_KEY) — not in git
+│
+├── yolov8n.onnx         ← Custom trained model: 7 indoor classes
+├── yolov8m.pt           ← General YOLOv8 medium model: 80 COCO classes
+├── yolo_detection.py    ← Local webcam detection script (dev/testing only)
+├── train_model.py       ← Fine-tunes YOLOv8 on custom dataset
+├── export_model.py      ← Copies best.onnx to root after training
+│
+├── train/               ← Training images + labels
+├── valid/               ← Validation images + labels
+├── test/                ← Test images + labels
+└── runs/                ← Training output (weights, plots, metrics)
+```
+
+---
+
+## Three User Roles
+
+| Role | Who | What they can do |
+|------|-----|-----------------|
+| `blind` | The visually impaired user | Use camera detection, start/end sessions |
+| `guardian` | Caregiver / parent | See alert dashboard, track sessions |
+| `admin` | System admin | Manage all users, view all alerts/sessions |
+
+**Privacy rules (enforced in code):**
+- Guardian receives TEXT-ONLY alerts. No camera feed, no real-time location.
+- Admin sees user accounts and device status only. No personal data, no camera.
+- Blind user controls their own location sharing.
+
+---
+
+## Database Tables
+
+### `users`
+| Column | Type | Notes |
+|--------|------|-------|
+| id | Integer | Primary key |
+| name | String | Full name |
+| phone | String | Unique. Rwandan format only: `+25078XXXXXXX` |
+| password_hash | String | bcrypt hashed |
+| role | Enum | `blind` / `guardian` / `admin` |
+| language | Enum | `en` / `rw` |
+| voice_speed | Enum | `Slow` / `Normal` / `Fast` |
+| status | Enum | `active` / `inactive` |
+| guardian_id | FK → users | Only set for blind users, points to their guardian |
+| emergency_phone | String | Optional, blind users only |
+| relationship | String | Guardian's relation to blind user e.g. "Mother" |
+| created_at | DateTime | Auto set |
+
+### `alerts`
+| Column | Type | Notes |
+|--------|------|-------|
+| id | Integer | Primary key |
+| blind_id | FK → users | The blind user who triggered the alert |
+| message | String | e.g. "STOP. car straight ahead" |
+| level | Enum | `safe` / `warning` / `danger` |
+| created_at | DateTime | Auto set |
+
+### `sessions`
+| Column | Type | Notes |
+|--------|------|-------|
+| id | Integer | Primary key |
+| blind_id | FK → users | The blind user |
+| started_at | DateTime | When navigation started |
+| ended_at | DateTime | Null = session still active |
+| status | Enum | `active` / `ended` |
+
+---
+
+## How to Set Up and Run (Local Dev)
+
+### Step 1 — Clone and enter the project
+```bash
+cd E-mboni
+```
+
+### Step 2 — Create and activate virtual environment
+```bash
+python3 -m venv venv
+source venv/bin/activate        # Linux / Mac
+# venv\Scripts\activate         # Windows
+```
+
+### Step 3 — Install all dependencies
+```bash
+pip install -r requirements.txt
+```
+
+### Step 4 — Create the .env file
+Create a file called `.env` in the project root with this content:
+```
+DATABASE_URL=sqlite:///./emboni.db
+SECRET_KEY=your-secret-key-change-in-production
+```
+To use PostgreSQL instead of SQLite:
+```
+DATABASE_URL=postgresql://postgres:yourpassword@localhost:5432/emboni
+SECRET_KEY=your-secret-key-change-in-production
+```
+
+### Step 5 — Create tables and seed demo accounts
+```bash
+venv/bin/python init_db.py
+```
+
+### Step 6 — Start the server
+```bash
+venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Server: `http://localhost:8000`
+Swagger UI (interactive docs): `http://localhost:8000/docs`
+
+> Note: first startup takes ~60 seconds because MiDaS downloads its weights (~50MB) on first run. Subsequent starts are instant (cached).
+
+---
+
+## Demo Accounts
+
+| Role | Phone | Password | Navigates to |
+|------|-------|----------|-------------|
+| admin | +250780000000 | admin123 | Admin dashboard |
+| guardian | +250781000001 | guardian123 | Guardian dashboard |
+| blind | +250781000002 | blind123 | Navigation screen |
+
+---
+
+## How the Detection Pipeline Works
+
+This is the most important part to understand. When `POST /detect` receives a camera frame:
+
+```
+JPEG frame received
         │
-        │  HTTPS / REST JSON
         ▼
-FastAPI Backend (Python)
+Decode with OpenCV
         │
-        ├── /auth/*         — login, register
-        ├── /detect         — YOLOv8 object detection (already exists)
-        ├── /users/*        — admin user management
-        ├── /alerts/*       — guardian alert feed
-        ├── /guardian/*     — guardian dashboard data
-        └── /session/*      — blind user navigation sessions
+        ▼
+Run yolov8n.onnx (custom 7-class model, conf=0.6)
+Run yolov8m.pt   (general 80-class model, conf=0.6)
+        │
+        ▼
+Merge + deduplicate results by label
+        │
+        ▼
+ConsistencyFilter — object must appear 2+ frames in a row
+(prevents ghost/false detections from being announced)
+        │
+        ▼
+spatial_engine.process_detections()
+— assigns direction (left/center/right) from bbox center x position
+— assigns distance using bbox area heuristic
+        │
+        ▼
+MiDaS depth model — gets depth score at object center pixel
+Blended with bbox heuristic: final_dist = bbox*0.5 + midas*0.5
+        │
+        ▼
+CrowdDetector — if 3+ people within ~2m, collapse to crowd summary
+        │
+        ▼
+Assign dangerLevel per object (see danger rules below)
+Sort: danger → warning → safe
+        │
+        ▼
+If blind user token present + top object is danger/warning:
+  → save alert to DB (guardian sees it)
+        │
+        ▼
+Build summary string for voice
+Return JSON response to frontend
 ```
 
----
+### Danger Level Rules
 
-## 3. User Roles
+```
+Any object < 0.3m          → always "danger"
+Any object < 0.6m          → "danger" if HIGH category, else "warning"
 
-There are exactly **3 roles** in the system:
+HIGH objects (car, truck, bus, motorcycle, vehicle, van):
+  distance <= 5m  → "danger"
+  else            → "warning"
 
-| Role       | Description                                              |
-|------------|----------------------------------------------------------|
-| `blind`    | The visually impaired user. Registered by a guardian.    |
-| `guardian` | The caregiver/parent. Creates their own account + links a blind user. |
-| `admin`    | System administrator. Has read access to all users, alerts, sessions. |
+MEDIUM objects (person, bicycle, chair, stairs, dog, cat, bench, pole...):
+  distance <= 1.5m → "danger"
+  distance <= 4m   → "warning"
+  else             → "safe"
 
----
+Critical objects (car, stair, truck, bus, motorcycle, stairs):
+  distance <= 1.5m → always "danger" regardless of category
+```
 
-## 4. Database Models
+### Distance Calculation
 
-Use any SQL database (PostgreSQL recommended) or SQLite for dev.
+MiDaS depth score is blended with a bounding box area heuristic:
 
-### 4.1 `users` table
+| Normalized bbox area | Estimated distance |
+|---------------------|--------------------|
+| > 0.40 | 0.5m |
+| > 0.20 | 1.0m |
+| > 0.10 | 2.0m |
+| > 0.05 | 3.5m |
+| > 0.02 | 6.0m |
+| > 0.01 | 10.0m |
+| else | 15.0m |
 
-| Column            | Type         | Notes                                      |
-|-------------------|--------------|--------------------------------------------|
-| `id`              | UUID / int   | Primary key                                |
-| `name`            | string       | Full name                                  |
-| `phone`           | string       | Unique. Format: `+250 7XX XXX XXX`         |
-| `password_hash`   | string       | bcrypt hashed                              |
-| `role`            | enum         | `blind` \| `guardian` \| `admin`           |
-| `language`        | enum         | `en` \| `rw`                               |
-| `voice_speed`     | enum         | `Slow` \| `Normal` \| `Fast`               |
-| `status`          | enum         | `active` \| `inactive`                     |
-| `guardian_id`     | FK → users   | Only set for `blind` users. Points to their guardian. |
-| `emergency_phone` | string       | Optional. Only for `blind` users.          |
-| `relationship`    | string       | Optional. Guardian's relationship to blind user (e.g. "Mother"). |
-| `created_at`      | datetime     | Auto                                       |
+Final distance = `bbox_estimate * 0.5 + midas_estimate * 0.5`
 
-### 4.2 `alerts` table
+### Direction Mapping
 
-| Column       | Type       | Notes                                              |
-|--------------|------------|----------------------------------------------------|
-| `id`         | UUID / int | Primary key                                        |
-| `blind_id`   | FK → users | The blind user who triggered the alert             |
-| `message`    | string     | e.g. `"Moving car — 3m on the left"`               |
-| `level`      | enum       | `safe` \| `warning` \| `danger`                    |
-| `created_at` | datetime   | Auto                                               |
+| Object center x (normalized) | Direction |
+|------------------------------|-----------|
+| 0.0 – 0.2 | far left → `"left"` |
+| 0.2 – 0.4 | left → `"left"` |
+| 0.4 – 0.6 | center → `"center"` |
+| 0.6 – 0.8 | right → `"right"` |
+| 0.8 – 1.0 | far right → `"right"` |
 
-### 4.3 `sessions` table
+### AI Models
 
-| Column       | Type       | Notes                                              |
-|--------------|------------|----------------------------------------------------|
-| `id`         | UUID / int | Primary key                                        |
-| `blind_id`   | FK → users | The blind user                                     |
-| `started_at` | datetime   | When navigation started                            |
-| `ended_at`   | datetime   | Nullable — null means session is active            |
-| `status`     | enum       | `active` \| `ended`                                |
+| Model | File | Classes | Purpose |
+|-------|------|---------|---------|
+| Custom | `yolov8n.onnx` | 7 | Indoor: bed, door, sofa, stair, table, toilet, person |
+| General | `yolov8m.pt` | 80 | COCO: cars, people, animals, furniture, etc. |
+| Depth | MiDaS small | — | Monocular depth estimation for distance accuracy |
 
 ---
 
-## 5. Authentication
+## Intelligence Engine (memory.py)
 
-### 5.1 `POST /auth/register`
+| Feature | How it works |
+|---------|-------------|
+| ConsistencyFilter | Object must appear 2+ consecutive frames before being reported. Prevents one-frame ghost detections from triggering voice alerts. |
+| CrowdDetector | If 3+ people detected within ~2m simultaneously, individual "person" alerts are collapsed into one crowd message: "Crowd ahead, navigate right. 3 people within 2 meters." HIGH hazards (car, stair) always bypass crowd mode. |
+| MemoryEngine | Tracks object history across frames. Suppresses stationary objects for 20 seconds after first report. |
+| TTC (Time-to-Collision) | If bbox area grows 20%+ in 2 frames → imminent collision, immediate STOP alert regardless of other rules. |
+| Vibration lock | Stair/ground hazard in bottom 20% of frame → continuous vibration until clear. |
+| Path clear | Requires 10 consecutive clean frames + 5 seconds since last DB alert before announcing "Path clear." |
 
-Called from **guardian-register screen** then **blind-register screen** in sequence.
+---
 
-**Request body (JSON):**
+## All API Endpoints
+
+Base URL: `http://localhost:8000`
+Protected endpoints require: `Authorization: Bearer <token>`
+
+### POST /auth/register
+Creates guardian + blind user pair together. No token required.
+
+Request:
 ```json
 {
   "guardian": {
     "name": "Sarah Kamau",
-    "phone": "+250 711 000 001",
+    "phone": "+250781000001",
     "password": "guardian123",
     "relationship": "Mother"
   },
   "blind_user": {
     "name": "James Kamau",
-    "phone": "+250 711 000 002",
-    "emergency_phone": "+250 700 000 000",
+    "phone": "+250781000002",
     "language": "en",
     "voice_speed": "Normal"
   }
 }
 ```
-
-**Response `201`:**
+Response 201:
 ```json
 {
-  "guardian": {
-    "id": 1,
-    "name": "Sarah Kamau",
-    "phone": "+250 711 000 001",
-    "role": "guardian"
-  },
-  "blind_user": {
-    "id": 2,
-    "name": "James Kamau",
-    "phone": "+250 711 000 002",
-    "role": "blind",
-    "guardian_id": 1
-  },
-  "token": "<jwt_token>"
+  "guardian": { "id": 1, "name": "Sarah Kamau", "phone": "+250781000001", "role": "guardian" },
+  "blind_user": { "id": 2, "name": "James Kamau", "phone": "+250781000002", "role": "blind", "guardian_id": 1 },
+  "token": "<jwt>"
 }
-```
-
-**Validation errors `422`:**
-```json
-{ "detail": "Phone number already registered" }
 ```
 
 ---
 
-### 5.2 `POST /auth/login`
+### POST /auth/login
+No token required.
 
-Called from the **login screen**.
+Request: `{ "phone": "+250781000001", "password": "guardian123" }`
 
-**Request body (JSON):**
+Response 200 (guardian):
 ```json
 {
-  "phone": "+250 711 000 001",
-  "password": "guardian123"
-}
-```
-
-**Response `200`:**
-```json
-{
-  "token": "<jwt_token>",
+  "token": "<jwt>",
   "user": {
-    "id": 1,
-    "name": "Sarah Kamau",
-    "role": "guardian",
-    "language": "en",
-    "voice_speed": "Normal",
-    "blind_user": {
-      "id": 2,
-      "name": "James Kamau",
-      "status": "active",
-      "language": "en"
-    }
+    "id": 1, "name": "Sarah Kamau", "role": "guardian",
+    "language": "en", "voice_speed": "Normal",
+    "blind_user": { "id": 2, "name": "James Kamau", "status": "active", "language": "en" }
   }
 }
 ```
+For blind login: same shape, `blind_user` is `null`, `role` is `"blind"`.
 
-For a `blind` user login, `blind_user` field is `null` and `role` is `"blind"`.  
-For an `admin` login, `role` is `"admin"`, no `blind_user` field needed.
-
-**Error `401`:**
-```json
-{ "detail": "Wrong phone or password." }
-```
-
-> The frontend currently uses demo accounts hardcoded. Replace them by wiring the login button to this endpoint.
-
-**Demo accounts to seed in DB:**
-
-| role     | phone              | password     | route after login |
-|----------|--------------------|--------------|-------------------|
-| guardian | +250 711 000 001   | guardian123  | /(guardian)       |
-| blind    | +250 711 000 002   | blind123     | /(tabs)           |
-| admin    | +250 711 000 000   | admin123     | /(admin)          |
+Error 401: `{ "detail": "Wrong phone or password." }`
 
 ---
 
-## 6. Detection Endpoint
+### GET /auth/me
+Returns current user profile. Requires any valid token.
 
-This already exists in `E-mboni/main.py`. The frontend calls it from `detectionService.ts`.
+---
 
-### 6.1 `POST /detect`
+### POST /detect
+The core endpoint. Send a camera frame, get detected objects back.
 
-**Current frontend call** (in `detectionService.ts` — `detectFromFrame` function):
-- Sends a base64 image string
-- Expects back a `DetectionResult` object
+Request: `multipart/form-data`, field name `file`, JPEG image.
+Optional: `Authorization: Bearer <token>` — if provided and the user is blind, danger/warning alerts are auto-saved to DB.
 
-**The frontend `DetectionResult` type:**
-```typescript
-interface DetectedObject {
-  name: string;           // e.g. "car", "chair"
-  isMoving: boolean;
-  distanceMeters: number;
-  direction: "left" | "center" | "right";
-  dangerLevel: "safe" | "warning" | "danger";
-}
-
-interface DetectionResult {
-  objects: DetectedObject[];
-  summary: string;        // voice string, e.g. "moving car, 3.0 meters ahead"
-  topDanger: "safe" | "warning" | "danger";
-}
-```
-
-**The existing `/detect` endpoint returns:**
-```json
-{
-  "detections": [
-    {
-      "object": "car",
-      "direction": "on your left",
-      "priority": "HIGH",
-      "vibe": "STRONG",
-      "speech": "STOP. car on your left"
-    }
-  ]
-}
-```
-
-**⚠️ MISMATCH — You must update `/detect` to return the frontend format OR update `detectFromFrame` in the frontend.**
-
-**Recommended: update `/detect` to return this format:**
+Response 200:
 ```json
 {
   "objects": [
     {
       "name": "car",
       "isMoving": true,
-      "distanceMeters": 3.0,
+      "distanceMeters": 3.5,
       "direction": "left",
       "dangerLevel": "danger"
     }
   ],
-  "summary": "moving car, 3.0 meters ahead",
+  "summary": "moving car, 3.5 meters ahead",
   "topDanger": "danger"
 }
 ```
 
-**Direction mapping** (existing backend → frontend):
-| Backend string      | Frontend value |
-|---------------------|----------------|
-| `"on your left"`    | `"left"`       |
-| `"straight ahead"`  | `"center"`     |
-| `"on your right"`   | `"right"`      |
-
-**isMoving logic** — objects considered moving:
-```
-car, truck, bus, motorcycle, bicycle, person, dog, cat, vehicle, van, scooter, animal
-```
-
-**distanceMeters from box_area** (match frontend heuristic):
-| box_area      | distanceMeters |
-|---------------|----------------|
-| > 0.4 (norm)  | 0.5            |
-| > 0.2         | 1.0            |
-| > 0.1         | 2.0            |
-| > 0.05        | 3.5            |
-| > 0.02        | 6.0            |
-| > 0.01        | 10.0           |
-| else          | 15.0           |
-
-> Note: frontend normalizes bbox area as `width * height` where both are 0–1. Backend uses pixel area. Convert: `norm_area = box_area / (img_w * img_h)`.
-
-**dangerLevel logic:**
-```
-HIGH_DANGER (car, truck, bus, motorcycle, vehicle, van):
-  distance <= 5m → "danger"
-  else           → "warning"
-
-MEDIUM_DANGER (bicycle, scooter, person, dog, cat, animal, chair, table, bench, pole, fire hydrant, trash can, staircase, stairs, step):
-  distance <= 1.5m → "danger"
-  distance <= 4m   → "warning"
-  else             → "safe"
-
-Everything else:
-  distance <= 1m → "warning"
-  else           → "safe"
-```
-
-**summary string** — build in the language passed via query param `?lang=en` or `?lang=rw`:
-
-English format: `"moving car, 3.0 meters ahead"` / `"chair, less than 1 meter ahead"`  
-Kinyarwanda format: `"imodoka igenda, metero 3.0 imbere yawe"` / `"intebe, munsi ya metero imwe imbere yawe"`
-
-Kinyarwanda object name map:
-```
-chair → intebe
-car → imodoka
-person → umuntu
-table → ameza
-dog → imbwa
-stairs → inzitiro
-bench → intebe ndefu
-bus → bisi
-pole → inkingi
-bicycle → igare
-trash can → agasanduku
-truck → kamyo
-motorcycle → moto
-cat → injangwe
-step → intambwe
-```
-
-Direction in Kinyarwanda:
-```
-center → imbere yawe
-left   → ibumoso bwawe
-right  → iburyo bwawe
-```
-
-**Request format** — the frontend sends base64 as JSON body:
-```json
-{ "image": "<base64_string>", "lang": "en" }
-```
-
-> The existing `/detect` uses `UploadFile`. You need to also accept JSON body with base64, OR update the frontend `detectFromFrame` to send multipart. Easiest: accept both.
+`direction`: `"left"` | `"center"` | `"right"`
+`dangerLevel`: `"safe"` | `"warning"` | `"danger"`
+`summary`: ready-to-speak string for the voice engine
+`topDanger`: the worst danger level across all detected objects
 
 ---
 
-## 7. Guardian Endpoints
+### GET /guardian/dashboard
+Requires guardian token.
 
-All require `Authorization: Bearer <token>` header.
+Returns guardian profile, linked blind user info, last 10 alerts, active session.
 
-### 7.1 `GET /guardian/dashboard`
-
-Returns the guardian's linked blind user status for the **Guardian Home screen**.
-
-**Response `200`:**
 ```json
 {
-  "guardian": {
-    "id": 1,
-    "name": "Sarah Kamau",
-    "initials": "SK",
-    "phone": "+250 711 000 001"
-  },
-  "blind_user": {
-    "id": 2,
-    "name": "James Kamau",
-    "initials": "JK",
-    "status": "Scanning",
-    "battery": 82,
-    "last_seen": "2 min ago"
-  },
+  "guardian": { "id": 1, "name": "Sarah Kamau", ... },
+  "blind_user": { "id": 2, "name": "James Kamau", "status": "active", ... },
   "recent_alerts": [
-    {
-      "message": "Chair — 1.5m ahead",
-      "time": "5 min ago",
-      "level": "warning"
-    }
-  ]
-}
-```
-
-`status` values: `"Safe"` | `"Scanning"` | `"Navigating"` | `"Idle"` | `"Obstacle Detected"` | `"Danger Alert"`  
-`battery` is an integer 0–100 (from device if available, else omit or return `null`).  
-`last_seen` is a human-readable relative time string.
-
----
-
-### 7.2 `GET /guardian/alerts`
-
-Returns all alerts for the guardian's linked blind user. Used by **Alerts screen**.
-
-**Response `200`:**
-```json
-{
-  "blind_user_name": "James Kamau",
-  "alerts": [
-    {
-      "id": 1,
-      "message": "Chair detected — 1.5m ahead",
-      "time": "Just now",
-      "level": "warning"
-    },
-    {
-      "id": 2,
-      "message": "Moving car — 3m on the left",
-      "time": "5 min ago",
-      "level": "danger"
-    }
-  ]
-}
-```
-
-`level` values: `"safe"` | `"warning"` | `"danger"`
-
----
-
-### 7.3 `GET /guardian/tracking`
-
-Returns the active session timeline for the guardian's linked blind user. Used by **Tracking screen**.
-
-**Response `200`:**
-```json
-{
-  "blind_user_name": "James Kamau",
-  "session": {
-    "status": "active",
-    "duration_minutes": 8,
-    "alert_count": 3,
-    "safety_status": "Safe"
-  },
-  "timeline": [
-    { "time": "10:40", "event": "Navigation stopped", "level": "muted" },
-    { "time": "10:38", "event": "Path clear",          "level": "safe"  },
-    { "time": "10:37", "event": "Moving car — 3m on the left", "level": "danger" },
-    { "time": "10:35", "event": "Path clear",          "level": "safe"  },
-    { "time": "10:34", "event": "Chair — 1.5m ahead",  "level": "warning" },
-    { "time": "10:32", "event": "Navigation started",  "level": "safe"  }
-  ]
-}
-```
-
-`level` values: `"safe"` | `"warning"` | `"danger"` | `"muted"`
-
----
-
-### 7.4 `GET /guardian/settings`
-
-Returns the guardian's profile and linked blind user preferences. Used by **Settings screen**.
-
-**Response `200`:**
-```json
-{
-  "guardian": {
-    "name": "Sarah Kamau",
-    "initials": "SK",
-    "phone": "+254 711 000 000"
-  },
-  "blind_user": {
-    "name": "James Kamau",
-    "language": "English",
-    "voice_speed": "Normal"
-  },
-  "emergency_contacts": {
-    "primary": "+254 700 000 000",
-    "secondary": null
-  },
-  "notifications": {
-    "push": true,
-    "sms": false,
-    "vibration": true
-  }
-}
-```
-
----
-
-### 7.5 `PATCH /guardian/settings`
-
-Updates guardian notification preferences and blind user preferences.
-
-**Request body:**
-```json
-{
-  "notifications": {
-    "push": true,
-    "sms": false,
-    "vibration": true
-  },
-  "blind_user": {
-    "language": "en",
-    "voice_speed": "Fast"
-  }
-}
-```
-
-**Response `200`:** same shape as `GET /guardian/settings`
-
----
-
-## 8. Admin Endpoints
-
-All require `Authorization: Bearer <token>` and `role == "admin"`.
-
-### 8.1 `GET /admin/overview`
-
-Used by **Admin Overview screen**.
-
-**Response `200`:**
-```json
-{
-  "stats": {
-    "total_users": 128,
-    "active_now": 14,
-    "guardians": 76,
-    "alerts_today": 32
-  },
-  "active_users": [
-    { "name": "James Kamau",  "status": "Navigating", "initials": "JK" },
-    { "name": "Alice Uwera",  "status": "Scanning",   "initials": "AU" },
-    { "name": "Eric Mugisha", "status": "Idle",        "initials": "EM" }
+    { "id": 1, "message": "STOP. car straight ahead", "level": "danger", "created_at": "..." }
   ],
-  "recent_alerts": [
-    { "user": "James Kamau",  "msg": "Moving car — 3m ahead",  "time": "2 min ago",  "level": "danger"  },
-    { "user": "Alice Uwera",  "msg": "Chair detected — 1.5m",  "time": "8 min ago",  "level": "warning" },
-    { "user": "Eric Mugisha", "msg": "Navigation started",      "time": "15 min ago", "level": "safe"    },
-    { "user": "Grace Ineza",  "msg": "Stairs — 1m ahead",      "time": "22 min ago", "level": "danger"  }
-  ]
+  "active_session": { "id": 1, "started_at": "...", "ended_at": null, "status": "active" }
 }
 ```
 
 ---
 
-### 8.2 `GET /admin/users`
+### GET /guardian/tracking
+Requires guardian token.
 
-Used by **Admin Users screen**.
+Returns session timeline for the tracking screen.
 
-**Response `200`:**
 ```json
 {
-  "total": 6,
-  "users": [
-    {
-      "id": 1,
-      "name": "James Kamau",
-      "initials": "JK",
-      "role": "blind",
-      "guardian": "Sarah Kamau",
-      "status": "active",
-      "language": "EN"
-    },
-    {
-      "id": 2,
-      "name": "Sarah Kamau",
-      "initials": "SK",
-      "role": "guardian",
-      "guardian": "—",
-      "status": "active",
-      "language": "EN"
-    }
-  ]
+  "blind_name": "James Kamau",
+  "blind_phone": "+250781000002",
+  "is_scanning": true,
+  "timeline": [
+    { "time": "10:37", "event": "STOP. car straight ahead", "level": "danger" }
+  ],
+  "session": { "status": "Danger", "duration_minutes": 8, "alert_count": 3 }
 }
 ```
 
-`role` values: `"blind"` | `"guardian"` | `"admin"`  
-`status` values: `"active"` | `"inactive"`  
-`language` values: `"EN"` | `"RW"`  
-`guardian` for guardian accounts: `"—"` (em dash string)
+---
+
+### GET /alerts
+Requires guardian or admin token.
+- Guardian → last 50 alerts for their linked blind user
+- Admin → last 100 alerts across all users
 
 ---
 
-## 9. Session Endpoints
+### GET /alerts/{blind_id}
+Requires admin token. All alerts for one specific blind user.
 
-### 9.1 `POST /session/start`
+---
 
-Called when blind user starts navigation (taps screen → `/(tabs)/navigation`).
+### POST /session/start
+Requires blind token. Starts a new navigation session. Auto-ends any previously active session.
 
-**Request body:**
-```json
-{ "blind_user_id": 2 }
+---
+
+### POST /session/end
+Requires blind token. Ends the current active session.
+
+---
+
+### GET /session/active
+Requires blind or guardian token. Returns the active session or null.
+
+---
+
+### GET /session/history
+Requires admin token. Returns last 100 sessions.
+
+---
+
+### GET /users
+Requires admin token. Returns all users.
+
+---
+
+### GET /users/{user_id}
+Requires admin token. Returns one user by ID.
+
+---
+
+### PATCH /users/{user_id}/status?status=inactive
+Requires admin token. Toggle user status: `active` or `inactive`.
+
+---
+
+### GET /location/last-known?user_id=X
+Returns last known location if user has enabled sharing. Guardian-facing.
+
+### POST /location/share?user_id=X&enabled=true
+Blind user controls whether their location is shared with guardian.
+
+### GET /devices/status?device_id=X
+Returns `"online"` or `"offline"` based on last ping. Admin-facing.
+
+### POST /devices/ping?device_id=X
+Heartbeat from device. Marks it as online.
+
+---
+
+## Phone Number Validation
+
+Only Rwandan phone numbers are accepted. Validated in `models.py`.
+
+Accepted:
+```
++250780000000   international MTN
++250790000000   international Airtel
++250720000000   international MTN
++250730000000   international Airtel
+0780000000      local 10 digits (any of above prefixes)
 ```
 
-**Response `201`:**
-```json
-{ "session_id": 10, "started_at": "2025-01-15T10:32:00Z" }
+Rejected:
+```
+0711234567      invalid prefix (71 not supported)
+078123456       too short (9 digits)
++1234567890     not Rwandan
+```
+
+Error message is bilingual (English + Kinyarwanda):
+```
+Inomero ya telefoni ntabwo ari yo / Phone number is invalid.
+Use +25078XXXXXXX or 078XXXXXXX (10 digits)
 ```
 
 ---
 
-### 9.2 `POST /session/end`
+## Frontend Integration — What Needs to Be Done
 
-Called when blind user long-presses stop button → `/(tabs)/stop`.
+The backend is fully ready. The React Native frontend still has hardcoded mock data. Here is every screen that needs to be wired up:
 
-**Request body:**
-```json
-{ "session_id": 10 }
+| Screen | File | Replace | With |
+|--------|------|---------|------|
+| Login | `app/(auth)/login.tsx` | `DEMO_ACCOUNTS` + `handleLogin()` | `POST /auth/login` |
+| Guardian register | `app/(auth)/guardian-register.tsx` | `handleNext()` | `POST /auth/register` |
+| Blind register | `app/(auth)/blind-register.tsx` | `handleDone()` | `POST /auth/register` |
+| Guardian home | `app/(guardian)/index.tsx` | `USER` + `ALERTS` | `GET /guardian/dashboard` |
+| Alerts screen | `app/(guardian)/alerts.tsx` | `ALERTS` | `GET /alerts` |
+| Tracking screen | `app/(guardian)/tracking.tsx` | `ACTIVITY` | `GET /guardian/tracking` |
+| Admin users | `app/(admin)/users.tsx` | `USERS` | `GET /users` |
+| Navigation screen | `app/(tabs)/navigation.tsx` | local loop | `POST /detect` + session start/end |
+
+### Token storage
+```typescript
+// After login, save token:
+await AsyncStorage.setItem("token", data.token);
+
+// On every protected request:
+const token = await AsyncStorage.getItem("token");
+headers: { "Authorization": `Bearer ${token}` }
 ```
 
-**Response `200`:**
-```json
-{ "ended_at": "2025-01-15T10:40:00Z", "duration_minutes": 8 }
-```
-
----
-
-### 9.3 `POST /session/alert`
-
-Called after each detection that produces a non-safe result. Frontend should call this from `detectFromFrame` after getting a result.
-
-**Request body:**
-```json
-{
-  "session_id": 10,
-  "blind_user_id": 2,
-  "message": "Moving car — 3.0 meters on your left",
-  "level": "danger"
-}
-```
-
-**Response `201`:**
-```json
-{ "alert_id": 55 }
-```
-
----
-
-## 10. Frontend Integration Points
-
-### 10.1 Where to replace mock data
-
-| File | Function/Variable | Replace with |
-|------|-------------------|--------------|
-| `services/detectionService.ts` | `detectFromFrame()` | Call `POST /detect` |
-| `app/(auth)/login.tsx` | `DEMO_ACCOUNTS` + `handleLogin()` | Call `POST /auth/login` |
-| `app/(auth)/guardian-register.tsx` | `handleNext()` | Call `POST /auth/register` (step 1) |
-| `app/(auth)/blind-register.tsx` | `handleDone()` | Call `POST /auth/register` (step 2) |
-| `app/(guardian)/index.tsx` | `USER` + `ALERTS` constants | Call `GET /guardian/dashboard` |
-| `app/(guardian)/alerts.tsx` | `ALERTS` constant | Call `GET /guardian/alerts` |
-| `app/(guardian)/tracking.tsx` | `ACTIVITY` constant | Call `GET /guardian/tracking` |
-| `app/(guardian)/settings.tsx` | hardcoded profile values | Call `GET /guardian/settings` |
-| `app/(admin)/index.tsx` | `STATS`, `RECENT_ALERTS`, `ACTIVE_USERS` | Call `GET /admin/overview` |
-| `app/(admin)/users.tsx` | `USERS` constant | Call `GET /admin/users` |
-| `app/(tabs)/navigation.tsx` | `startLoop()` | Call `POST /session/start` on mount, `POST /session/alert` on each detection, `POST /session/end` on stop |
-
----
-
-### 10.2 Token storage
-
-Store the JWT token in `AsyncStorage` with key `@emboni_token`.  
-Read it and attach as `Authorization: Bearer <token>` header on all protected requests.
-
----
-
-### 10.3 Base URL
-
-Define a single constant in the frontend:
+### Base URL
 ```typescript
 // services/api.ts
-export const API_BASE = 'http://<your-server-ip>:8000';
+export const API_BASE = "http://<your-computer-lan-ip>:8000";
+// Example: "http://192.168.1.5:8000"
+// Do NOT use "localhost" from the phone — use the computer's WiFi IP
+// Find it with: ip addr show (Linux) or ipconfig (Windows)
 ```
 
-For local dev, use your laptop's LAN IP (e.g. `http://192.168.1.x:8000`).  
-The mobile device and backend laptop must be on the same WiFi network.
+### Sending a camera frame to /detect
+```typescript
+const formData = new FormData();
+formData.append("file", {
+  uri: frameUri,
+  type: "image/jpeg",
+  name: "frame.jpg",
+} as any);
+
+const response = await fetch(`${API_BASE}/detect`, {
+  method: "POST",
+  headers: { "Authorization": `Bearer ${token}` },
+  body: formData,
+});
+const result = await response.json();
+// result.summary  → speak this
+// result.topDanger → "danger" / "warning" / "safe" → vibrate accordingly
+```
+
+### Starting and ending a session
+```typescript
+// When navigation screen opens (blind user only):
+await fetch(`${API_BASE}/session/start`, {
+  method: "POST",
+  headers: { "Authorization": `Bearer ${token}` },
+});
+
+// When navigation screen closes:
+await fetch(`${API_BASE}/session/end`, {
+  method: "POST",
+  headers: { "Authorization": `Bearer ${token}` },
+});
+```
+
+### Polling guardian dashboard (every 5 seconds)
+```typescript
+useEffect(() => {
+  const interval = setInterval(async () => {
+    const token = await AsyncStorage.getItem("token");
+    const res = await fetch(`${API_BASE}/guardian/dashboard`, {
+      headers: { "Authorization": `Bearer ${token}` },
+    });
+    const data = await res.json();
+    setAlerts(data.recent_alerts);
+    setBlindUser(data.blind_user);
+    setSession(data.active_session);
+  }, 5000);
+  return () => clearInterval(interval);
+}, []);
+```
+
+### Error handling
+All errors come back as:
+```json
+{ "detail": "Wrong phone or password." }
+```
+Validation errors (422):
+```json
+{ "detail": [{ "loc": ["body", "phone"], "msg": "Phone number is invalid..." }] }
+```
 
 ---
 
-## 11. Existing Backend File Reference
+## Missing Endpoints (Not Yet Built)
 
-**`E-mboni/main.py`** — FastAPI app, already has `/detect` endpoint.  
-**`E-mboni/requirements.txt`** — current deps: `fastapi`, `uvicorn`, `python-multipart`, `ultralytics`, `opencv-python-headless`, `onnxruntime`
+These screens exist in the frontend but the backend endpoints are not yet implemented:
 
-**Add these dependencies:**
+| Endpoint | Screen |
+|----------|--------|
+| `GET /guardian/settings` | Guardian settings screen |
+| `PATCH /guardian/settings` | Guardian settings update |
+| `GET /admin/overview` | Admin overview with stats |
+
+---
+
+## Dependencies (requirements.txt)
+
 ```
-passlib[bcrypt]
-python-jose[cryptography]
+fastapi
+uvicorn
+python-multipart
+opencv-python-headless
+onnxruntime
 sqlalchemy
-psycopg2-binary   # or use aiosqlite for SQLite
+bcrypt
+python-jose[cryptography]
+psycopg2-binary
 python-dotenv
+torch --index-url https://download.pytorch.org/whl/cpu
+timm
+ultralytics
 ```
 
-**Run command:**
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-```
+> `timm` is required by MiDaS. `torch` is pinned to CPU build to avoid downloading 900MB+ CUDA packages.
 
 ---
 
-## 12. CORS
+## Known Issues / Troubleshooting
 
-Already configured in `main.py`:
-```python
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-```
-This is fine for development. Restrict `allow_origins` to your app's domain in production.
-
----
-
-## 13. Models Used
-
-| Model file      | Type    | Classes | conf  | Used for                        |
-|-----------------|---------|---------|-------|---------------------------------|
-| `yolov8n.onnx`  | Custom  | 7       | 0.2   | Indoor: bed, door, sofa, stair, table, toilet, person |
-| `yolov8n.pt`    | General | 80      | 0.25  | COCO: cars, people, animals, etc. |
-
-Both run on every frame. Results are merged and filtered through `eye_of_blind_list`.
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `ModuleNotFoundError: timm` | MiDaS dependency missing | `pip install timm` |
+| `Address already in use` on port 8000 | Old server still running | `fuser -k 8000/tcp` |
+| First startup very slow | MiDaS downloading weights (~50MB) | Wait ~60s, it only downloads once |
+| `Connection refused` on phone | Using `localhost` instead of LAN IP | Use computer's IP: `192.168.x.x:8000` |
+| `401 Unauthorized` | Token missing or expired | Login again and save the new token |
+| `403 Forbidden` | Wrong role for that endpoint | Use the correct demo account |
+| `422 Validation Error` | Wrong phone format or short password | Phone must be Rwandan format, password 6+ chars |
 
 ---
 
-## 14. Color Reference (for any admin UI you build)
+## Current Status
 
-```
-Background:  #0C0B12
-Card:        #13111C
-Border:      #1E1A2E
-Text:        #EDE9F8
-Muted:       #6B6480
-Accent:      #A855F7
-Safe:        #4ADE80
-Warning:     #FBBF24
-Danger:      #F87171
-```
-
----
-
-## 15. Summary Checklist
-
-- [ ] `POST /auth/register` — creates guardian + blind user pair
-- [ ] `POST /auth/login` — returns JWT + user object with role
-- [ ] `POST /detect` — returns `DetectionResult` in frontend format
-- [ ] `GET /guardian/dashboard` — blind user status + recent alerts
-- [ ] `GET /guardian/alerts` — full alert list
-- [ ] `GET /guardian/tracking` — session timeline
-- [ ] `GET /guardian/settings` — profile + preferences
-- [ ] `PATCH /guardian/settings` — update preferences
-- [ ] `GET /admin/overview` — stats + active users + recent alerts
-- [ ] `GET /admin/users` — full user list
-- [ ] `POST /session/start` — start navigation session
-- [ ] `POST /session/end` — end navigation session
-- [ ] `POST /session/alert` — log a detection alert
-- [ ] JWT middleware protecting all non-auth routes
-- [ ] DB seeded with 3 demo accounts (guardian, blind, admin)
-
-
-## Something to guide you!
+| Component | Status |
+|-----------|--------|
+| All backend endpoints | Done |
+| Database (SQLite local / PostgreSQL prod) | Done |
+| JWT authentication | Done |
+| YOLOv8 detection (2 models) | Done |
+| MiDaS depth blending | Done |
+| Crowd detection | Done |
+| Consistency filter | Done |
+| Privacy model | Done |
+| Demo accounts seeded | Done |
+| Virtual environment | Done |
+| Frontend wiring | Not started |
+| `GET /guardian/settings` | Not built |
+| `PATCH /guardian/settings` | Not built |
+| `GET /admin/overview` | Not built |
+| Production deployment | Not done |

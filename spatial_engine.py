@@ -9,6 +9,68 @@ from typing import Optional
 
 
 # ---------------------------------------------------------------------------
+# Label Aliases — map YOLO class names to our internal names
+# ---------------------------------------------------------------------------
+
+ALIAS_MAP = {
+    "couch":        "sofa",
+    "dining table": "table",
+    "bed":          "bed",
+    "potted plant": "plant",
+    "tv":           "screen",
+    "laptop":       "screen",
+}
+
+# Labels to silently drop before any processing
+IGNORE_CLASSES = {
+    "couch",        # aliased to sofa — avoid double detection
+    "refrigerator",
+    "oven",
+    "microwave",
+    "sink",
+    "toilet",       # rarely relevant outdoors
+    "clock",
+    "vase",
+    "scissors",
+    "toothbrush",
+}
+
+
+def apply_alias(label: str) -> str:
+    """Translate raw YOLO label to our canonical label."""
+    return ALIAS_MAP.get(label, label)
+
+
+# ---------------------------------------------------------------------------
+# Custom Geometry Rules
+# ---------------------------------------------------------------------------
+
+def apply_custom_rules(label: str, norm_x: float, norm_y: float,
+                       box_w: float, box_h: float) -> Optional[str]:
+    """
+    Applies geometry-based filtering rules.
+    Returns None to keep the detection, or a string reason to ignore it.
+
+    Rules:
+    - bed detected but bounding box is vertical (h > w * 1.5) → likely a closet, ignore
+    - person detected but bbox is very narrow and tall → likely a pole/post, ignore
+    - stair detected in upper 30% of frame (norm_y < 0.3) → likely a false positive, ignore
+    """
+    aspect = box_h / box_w if box_w > 0 else 1.0
+
+    if label == "bed" and aspect > 1.5:
+        return "vertical_bed_ignored_likely_closet"
+
+    if label == "person" and aspect > 4.0 and box_w < 0.05:
+        return "narrow_tall_ignored_likely_pole"
+
+    if label == "stair" and norm_y < 0.3:
+        return "stair_in_upper_frame_ignored"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Object Priority Tiers
 # ---------------------------------------------------------------------------
 
@@ -18,11 +80,11 @@ DANGER_OBJECTS = [
 ]
 
 NAVIGATION_OBJECTS = [
-    "chair", "dining table", "door", "sofa", "bed", "toilet",
+    "chair", "table", "door", "sofa", "bed", "screen",
 ]
 
 UTILITY_OBJECTS = [
-    "backpack", "suitcase", "dog", "cat", "fire hydrant",
+    "backpack", "suitcase", "dog", "cat", "fire hydrant", "plant",
 ]
 
 ALL_OBJECTS = DANGER_OBJECTS + NAVIGATION_OBJECTS + UTILITY_OBJECTS
@@ -38,6 +100,8 @@ class RawDetection:
     box_area: float   # pixel area: (x2-x1) * (y2-y1)
     norm_x: float     # normalized center x: 0.0 (left) → 1.0 (right)
     norm_y: float     # normalized center y: 0.0 (top)  → 1.0 (bottom)
+    box_w: float = 0.0   # normalized width  (x2-x1) / img_w
+    box_h: float = 0.0   # normalized height (y2-y1) / img_h
 
 @dataclass
 class DetectionResult:
@@ -45,6 +109,7 @@ class DetectionResult:
     direction: str          # e.g. "straight ahead, low"
     distance: Optional[str] # e.g. "1 meter" or None if too far
     priority: str           # HIGH / MEDIUM / LOW
+    danger_score: float     # 0.0–1.0 combined urgency score
     vibe: Optional[str]     # STRONG / LIGHT / PULSE / None
     vibe_pattern: Optional[str] # e.g. "THREE_SHORT" for stairs, "LONG" for overhangs
     speech: str             # full natural language alert
@@ -56,11 +121,12 @@ class DetectionResult:
 # ---------------------------------------------------------------------------
 
 def get_horizontal(norm_x: float) -> str:
-    """5-zone horizontal positioning."""
-    if norm_x < 0.2:    return "to your far left"
-    elif norm_x < 0.4:  return "on your left"
-    elif norm_x <= 0.6: return "straight ahead"
-    elif norm_x <= 0.8: return "on your right"
+    """6-zone horizontal positioning for more precise guidance."""
+    if norm_x < 0.17:   return "to your far left"
+    elif norm_x < 0.33: return "on your left"
+    elif norm_x < 0.5:  return "slightly left ahead"
+    elif norm_x < 0.67: return "straight ahead"
+    elif norm_x < 0.83: return "on your right"
     else:               return "to your far right"
 
 def get_vertical(norm_y: float) -> Optional[str]:
@@ -227,17 +293,44 @@ def build_speech(label: str, direction: str, distance: Optional[str], priority: 
 # Main Processing Function
 # ---------------------------------------------------------------------------
 
+def _compute_danger_score(priority: str, box_area: float) -> float:
+    """
+    Combines priority tier and proximity into a 0.0–1.0 urgency score.
+    Larger box_area = closer object = higher score.
+    """
+    base = {"HIGH": 0.7, "MEDIUM": 0.4, "LOW": 0.1}.get(priority, 0.0)
+    # Proximity bonus: normalise box_area against a 640x480 frame (307200 px)
+    proximity = min(box_area / 307200, 1.0) * 0.3
+    return round(min(base + proximity, 1.0), 3)
+
+
 def process_detections(raw_detections: list[RawDetection]) -> list[DetectionResult]:
     """
     Takes a list of RawDetection objects and returns a sorted list of
     DetectionResult objects ready for the API response or voice engine.
 
-    Sorted by priority: HIGH → MEDIUM → LOW
+    Pipeline:
+    1. Apply alias map (couch → sofa, dining table → table, etc.)
+    2. Drop ignored classes
+    3. Apply custom geometry rules (vertical bed → closet, narrow person → pole)
+    4. Score and sort by danger_score descending
     """
     results = []
 
     for det in raw_detections:
+        # Step 1 — alias
+        det.label = apply_alias(det.label)
+
+        # Step 2 — ignore list
+        if det.label in IGNORE_CLASSES:
+            continue
+
         if det.label not in ALL_OBJECTS:
+            continue
+
+        # Step 3 — custom geometry rules
+        reason = apply_custom_rules(det.label, det.norm_x, det.norm_y, det.box_w, det.box_h)
+        if reason:
             continue
 
         priority = get_priority(det.label)
@@ -248,6 +341,7 @@ def process_detections(raw_detections: list[RawDetection]) -> list[DetectionResu
         horizontal    = get_horizontal(det.norm_x)
         vertical_zone = get_vertical_zone(det.norm_y)
         distance      = get_distance(det.box_area)
+        danger_score  = _compute_danger_score(priority, det.box_area)
         vibe, vibe_pattern = get_vibe_pattern(det.label, vertical_zone, priority)
         speech        = build_vertical_speech(det.label, horizontal, vertical_zone, distance, priority)
 
@@ -256,12 +350,12 @@ def process_detections(raw_detections: list[RawDetection]) -> list[DetectionResu
             direction=direction,
             distance=distance,
             priority=priority,
+            danger_score=danger_score,
             vibe=vibe,
             vibe_pattern=vibe_pattern,
             speech=speech,
             vertical_zone=vertical_zone,
         ))
 
-    priority_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-    results.sort(key=lambda r: priority_order.get(r.priority, 3))
+    results.sort(key=lambda r: r.danger_score, reverse=True)
     return results

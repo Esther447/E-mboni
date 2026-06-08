@@ -6,7 +6,7 @@ Also detects approaching vs. stationary objects via box_area history.
 """
 
 import time
-from collections import deque
+from collections import deque, Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -249,36 +249,89 @@ class MemoryEngine:
 # Consistency Filter — object must appear in N consecutive frames to be reported
 # ---------------------------------------------------------------------------
 
-CONSISTENCY_REQUIRED = 2  # frames an object must appear in a row before alerting
+# Consistency: frames an object must appear in to be confirmed
+CONSISTENCY_REQUIRED = 3   # raised from 2 — object must appear in 3 of last 5 frames
+CONSISTENCY_WINDOW   = 5   # sliding window size
+
+# Person motion: position change threshold to classify as moving vs stationary
+PERSON_MOTION_THRESHOLD = 0.04  # normalised coords — if centre moves > 4% of frame width, moving
+
+
+class PersonMotionState:
+    MOVING   = "moving"
+    SITTING  = "sitting"
+    STANDING = "standing"
+    UNKNOWN  = "unknown"
 
 
 class ConsistencyFilter:
     """
-    Prevents one-frame ghost detections from triggering alerts.
-    An object is only "confirmed" after appearing in CONSISTENCY_REQUIRED
-    consecutive frames. Resets counter if object disappears for a frame.
+    Tracks the last CONSISTENCY_WINDOW frames for each label.
+    An object is confirmed if it appears in >= CONSISTENCY_REQUIRED of those frames.
+    This is more robust than a simple streak counter — a one-frame dropout
+    (e.g. YOLO misses frame 3 but sees frames 1,2,4,5) still confirms.
+
+    Also tracks person position across frames to classify:
+    - person moving   (centre x/y shifts > threshold between frames)
+    - person sitting  (bbox aspect ratio tall+narrow AND stationary)
+    - person standing (bbox aspect ratio tall, stationary, centre-mid frame)
     """
 
     def __init__(self):
-        self._streak: dict[str, int] = {}   # label → consecutive frame count
-        self._seen_this_frame: set[str] = set()
+        self._history: dict[str, deque] = {}       # label → deque of 0/1 (seen/not seen)
+        self._person_positions: deque = deque(maxlen=CONSISTENCY_WINDOW)  # (norm_x, norm_y, box_h, box_w)
 
     def update(self, detected_labels: list[str]):
         """Call once per frame with the list of detected labels."""
         current = set(detected_labels)
 
-        # Increment streak for seen objects, reset for missing ones
-        for label in current:
-            self._streak[label] = self._streak.get(label, 0) + 1
-        for label in list(self._streak):
-            if label not in current:
-                self._streak[label] = 0
+        # Update sliding window for every tracked label
+        all_known = set(self._history.keys()) | current
+        for label in all_known:
+            if label not in self._history:
+                self._history[label] = deque(maxlen=CONSISTENCY_WINDOW)
+            self._history[label].append(1 if label in current else 0)
 
-        self._seen_this_frame = current
+    def update_person_position(self, norm_x: float, norm_y: float, box_w: float, box_h: float):
+        """Call when a person is detected, to track their position over frames."""
+        self._person_positions.append((norm_x, norm_y, box_w, box_h))
 
     def is_confirmed(self, label: str) -> bool:
-        """Returns True only if object has appeared CONSISTENCY_REQUIRED frames in a row."""
-        return self._streak.get(label, 0) >= CONSISTENCY_REQUIRED
+        """Returns True if object appeared in >= CONSISTENCY_REQUIRED of last CONSISTENCY_WINDOW frames."""
+        history = self._history.get(label)
+        if not history:
+            return False
+        return sum(history) >= CONSISTENCY_REQUIRED
+
+    def get_person_motion_state(self) -> str:
+        """
+        Analyses recent person position history to classify motion state.
+
+        - MOVING:   centre position changed > PERSON_MOTION_THRESHOLD between frames
+        - SITTING:  stationary + bbox wider relative to height (aspect < 1.2)
+        - STANDING: stationary + bbox tall (aspect >= 1.2)
+        - UNKNOWN:  not enough frames yet
+        """
+        if len(self._person_positions) < 2:
+            return PersonMotionState.UNKNOWN
+
+        # Check position change across all stored frames
+        positions = list(self._person_positions)
+        max_movement = 0.0
+        for i in range(1, len(positions)):
+            dx = abs(positions[i][0] - positions[i-1][0])
+            dy = abs(positions[i][1] - positions[i-1][1])
+            max_movement = max(max_movement, dx, dy)
+
+        if max_movement > PERSON_MOTION_THRESHOLD:
+            return PersonMotionState.MOVING
+
+        # Stationary — classify by aspect ratio of most recent bbox
+        _, _, box_w, box_h = positions[-1]
+        aspect = box_h / box_w if box_w > 0 else 1.0
+        if aspect < 1.2:
+            return PersonMotionState.SITTING
+        return PersonMotionState.STANDING
 
 
 # ---------------------------------------------------------------------------

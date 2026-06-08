@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from typing import Optional, List
 import cv2
 import numpy as np
+from collections import deque, Counter
 import uvicorn
 import logging
 
@@ -38,7 +39,7 @@ from models import (
 )
 from spatial_engine import RawDetection, process_detections, ALL_OBJECTS
 from events import event_store
-from memory import CrowdDetector, ConsistencyFilter
+from memory import CrowdDetector, ConsistencyFilter, PersonMotionState
 from datetime import datetime, timezone
 
 # One crowd detector and one consistency filter shared across all requests
@@ -96,8 +97,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-custom_model = YOLO("yolov8n.onnx", task="detect")
-general_model = YOLO("yolov8n.pt",   task="detect")
+custom_model = YOLO("yolov8n.onnx", task="detect")  # custom indoor classes
+general_model = YOLO("yolov8x.pt",  task="detect")  # largest model — best accuracy
+
+# MiDaS depth estimation (runs alongside YOLO for better distance accuracy)
+import torch
+_midas_model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True)
+_midas_model.eval()
+_midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True).small_transform
+_midas_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_midas_model.to(_midas_device)
+
+
+def _midas_depth_at(img_bgr: np.ndarray, cx: float, cy: float) -> Optional[float]:
+    """
+    Returns a normalised depth value 0.0 (far) → 1.0 (near) for the pixel (cx, cy)
+    where cx/cy are normalised [0,1] coordinates.
+    Returns None if inference fails.
+    """
+    try:
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        input_tensor = _midas_transforms(img_rgb).to(_midas_device)
+        with torch.no_grad():
+            depth_map = _midas_model(input_tensor).squeeze().cpu().numpy()
+        h, w = depth_map.shape
+        px, py = int(cx * w), int(cy * h)
+        px, py = max(0, min(px, w - 1)), max(0, min(py, h - 1))
+        d_min, d_max = depth_map.min(), depth_map.max()
+        if d_max - d_min < 1e-5:
+            return None
+        return float((depth_map[py, px] - d_min) / (d_max - d_min))  # higher = nearer
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -242,8 +273,34 @@ def _norm_area_to_meters(norm_area: float) -> float:
     return 15.0
 
 
+def _blend_distance(norm_area: float, midas_score: Optional[float]) -> float:
+    """
+    Blends bounding-box heuristic with MiDaS depth score.
+    midas_score is 0.0 (far) → 1.0 (near), so we map it to meters.
+    If MiDaS is unavailable falls back to bbox-only estimate.
+    """
+    bbox_m = _norm_area_to_meters(norm_area)
+    if midas_score is None:
+        return bbox_m
+    # MiDaS near → 0.3 m, far → 20 m (log-space blend)
+    midas_m = 0.3 + (1.0 - midas_score) * 19.7
+    return round(bbox_m * 0.5 + midas_m * 0.5, 2)
+
+
 def _danger_level(name: str, distance: float) -> str:
-    # Safety brain rule: car or stair within 1.5m → always danger, save immediately
+    """
+    Structured danger level system.
+    distance < 0.3 m  → HIGH (imminent)
+    distance < 0.6 m  → MEDIUM (close)
+    else              → LOW — then refined by object category and actual distance.
+    """
+    # Universal proximity override
+    if distance < 0.3:
+        return "danger"
+    if distance < 0.6:
+        return "danger" if name in HIGH_DANGER_OBJECTS else "warning"
+
+    # Safety brain rule: critical objects within 1.5m → always danger
     if name in CRITICAL_CLOSE_OBJECTS and distance <= 1.5:
         return "danger"
     if name in HIGH_DANGER_OBJECTS:
@@ -261,12 +318,22 @@ def _map_direction(direction_str: str) -> str:
     return DIRECTION_MAP.get(base, "center")
 
 
-def _build_summary(objects: list[DetectedObject]) -> str:
+def _build_summary(objects: list[DetectedObject], person_motion: str = PersonMotionState.UNKNOWN) -> str:
     if not objects:
         return "Path clear."
     top = objects[0]
-    moving = "moving " if top.isMoving else ""
-    return f"{moving}{top.name}, {top.distanceMeters:.1f} meters {'ahead' if top.direction == 'center' else top.direction}"
+    if top.name == "person":
+        if person_motion == PersonMotionState.MOVING:
+            label = "moving person"
+        elif person_motion == PersonMotionState.SITTING:
+            label = "person sitting"
+        elif person_motion == PersonMotionState.STANDING:
+            label = "person standing nearby"
+        else:
+            label = "person"
+    else:
+        label = ("moving " if top.isMoving else "") + top.name
+    return f"{label}, {top.distanceMeters:.1f} meters {'ahead' if top.direction == 'center' else top.direction}"
 
 
 def _save_alert(db: Session, blind_id: int, message: str, level: str):
@@ -303,6 +370,41 @@ def _last_alert_seconds_ago(db: Session, blind_id: int) -> float:
 PATH_CLEAR_SILENCE_SECONDS = 5.0  # must be this long since last alert to say "Path clear"
 
 
+# COCO class IDs we care about — filters irrelevant classes (airplane, kite, frisbee, etc.)
+# Passing this to model.track() speeds up inference and reduces false positives
+GENERAL_MODEL_CLASSES = [
+    0,   # person
+    1,   # bicycle
+    2,   # car
+    3,   # motorcycle
+    5,   # bus
+    7,   # truck
+    9,   # traffic light
+    10,  # fire hydrant
+    13,  # bench
+    15,  # cat
+    16,  # dog
+    24,  # backpack
+    28,  # suitcase
+    56,  # chair
+    59,  # bed
+    60,  # dining table
+    61,  # toilet
+]
+
+# Label smoothing — last 5 frames per tracker ID, most common label wins
+# Prevents "bed → sofa → bed" flickering between frames
+_label_history: dict[int, deque] = {}  # tracker_id → deque of labels
+
+
+def _smooth_label(tracker_id: int, label: str) -> str:
+    """Returns the most common label seen for this tracker ID over last 5 frames."""
+    if tracker_id not in _label_history:
+        _label_history[tracker_id] = deque(maxlen=5)
+    _label_history[tracker_id].append(label)
+    return Counter(_label_history[tracker_id]).most_common(1)[0][0]
+
+
 @app.post("/detect", response_model=DetectionResult, tags=["Detection"])
 async def detect(
     file: UploadFile = File(...),
@@ -332,31 +434,54 @@ async def detect(
         except Exception:
             pass
 
-    # --- Run both YOLO models ---
-    results_c = custom_model(img, conf=0.6)
-    results_g = general_model(img, conf=0.6)
+    # --- Run both YOLO models with class filter + persistent tracking ---
+    results_c = custom_model.track(img, conf=0.65, persist=True, verbose=False)
+    results_g = general_model.track(img, conf=0.65, persist=True, verbose=False,
+                                    classes=GENERAL_MODEL_CLASSES)
 
     raw_detections: list[RawDetection] = []
     seen_labels: set[str] = set()
+    door_detected = False
 
     for r in (results_c + results_g):
         for box in r.boxes:
-            label = r.names[int(box.cls[0])]
+            raw_label = r.names[int(box.cls[0])]
+
+            # Label smoothing: use tracker ID if available, else raw label
+            tracker_id = int(box.id[0]) if box.id is not None else -1
+            label = _smooth_label(tracker_id, raw_label) if tracker_id >= 0 else raw_label
+
+            if label == "door":
+                door_detected = True
+                continue  # door handled separately below
+
             if label not in ALL_OBJECTS or label in seen_labels:
                 continue
             x1, y1, x2, y2 = box.xyxy[0]
+            bw = float((x2 - x1) / w)
+            bh = float((y2 - y1) / h)
+            cx = float(((x1 + x2) / 2) / w)
+            cy = float(((y1 + y2) / 2) / h)
             raw_detections.append(RawDetection(
                 label=label,
                 box_area=float((x2 - x1) * (y2 - y1)),
-                norm_x=float(((x1 + x2) / 2) / w),
-                norm_y=float(((y1 + y2) / 2) / h),
+                norm_x=cx,
+                norm_y=cy,
+                box_w=bw,
+                box_h=bh,
             ))
             seen_labels.add(label)
 
     spatial_results = process_detections(raw_detections)
 
-    # --- CONSISTENCY FILTER: only report objects seen 2+ frames in a row ---
+    # --- CONSISTENCY FILTER: only report objects confirmed in 3 of last 5 frames ---
     _consistency.update([r.label for r in raw_detections])
+
+    # Track person position for motion state classification
+    for r in raw_detections:
+        if r.label == "person":
+            _consistency.update_person_position(r.norm_x, r.norm_y, r.box_w, r.box_h)
+
     raw_detections = [r for r in raw_detections if _consistency.is_confirmed(r.label)]
     spatial_results = [s for s in spatial_results if _consistency.is_confirmed(s.object)]
 
@@ -372,7 +497,8 @@ async def detect(
         if not raw:
             continue
         norm_area = raw.box_area / (w * h)
-        dist_m = _norm_area_to_meters(norm_area)
+        midas_score = _midas_depth_at(img, raw.norm_x, raw.norm_y)
+        dist_m = _blend_distance(norm_area, midas_score)
         direction = _map_direction(spatial.direction)
         detected_objects.append(DetectedObject(
             name=raw.label,
@@ -416,7 +542,8 @@ async def detect(
         else:
             summary = "Path clear."
     else:
-        summary = _build_summary(detected_objects)
+        person_motion = _consistency.get_person_motion_state()
+        summary = _build_summary(detected_objects, person_motion)
 
     logger.info(f"DETECT | user={blind_user.phone if blind_user else 'anonymous'} | topDanger={top_danger} | objects={len(detected_objects)}")
     return DetectionResult(objects=detected_objects, summary=summary, topDanger=top_danger)
@@ -719,6 +846,87 @@ def guardian_tracking(
             "alert_count": len(alerts),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# /admin/overview  — stats for admin dashboard
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/overview", tags=["Admin"])
+def admin_overview(
+    current_user: User = Depends(_require_role(RoleEnum.admin)),
+    db: Session = Depends(get_db),
+):
+    from datetime import date
+    total_users      = db.query(User).count()
+    total_guardians  = db.query(User).filter(User.role == RoleEnum.guardian).count()
+
+    # Active now = blind users who have an active session
+    active_blind_ids = [
+        row.blind_id for row in
+        db.query(NavSession.blind_id).filter(NavSession.status == SessionStatusEnum.active).all()
+    ]
+    active_now = len(active_blind_ids)
+
+    # Alerts created today
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    alerts_today = db.query(Alert).filter(Alert.created_at >= today_start).count()
+
+    # Active users list
+    active_users = []
+    for blind_id in active_blind_ids:
+        u = db.query(User).filter(User.id == blind_id).first()
+        if u:
+            active_users.append({
+                "id":     u.id,
+                "name":   u.name,
+                "status": "Scanning",
+            })
+
+    # Recent alerts (last 10 across all users)
+    recent = db.query(Alert).order_by(Alert.created_at.desc()).limit(10).all()
+    recent_alerts = []
+    for a in recent:
+        blind = db.query(User).filter(User.id == a.blind_id).first()
+        recent_alerts.append({
+            "id":         a.id,
+            "user_name":  blind.name if blind else "Unknown",
+            "message":    a.message,
+            "level":      a.level.value,
+            "created_at": a.created_at.isoformat(),
+        })
+
+    return {
+        "total_users":      total_users,
+        "total_guardians":  total_guardians,
+        "active_now":       active_now,
+        "alerts_today":     alerts_today,
+        "active_users":     active_users,
+        "recent_alerts":    recent_alerts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# /admin/logs  — full activity log for admin logs screen
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/logs", tags=["Admin"])
+def admin_logs(
+    current_user: User = Depends(_require_role(RoleEnum.admin)),
+    db: Session = Depends(get_db),
+):
+    alerts = db.query(Alert).order_by(Alert.created_at.desc()).limit(200).all()
+    result = []
+    for a in alerts:
+        blind = db.query(User).filter(User.id == a.blind_id).first()
+        result.append({
+            "id":         a.id,
+            "user_name":  blind.name if blind else "Unknown",
+            "message":    a.message,
+            "level":      a.level.value,
+            "created_at": a.created_at.isoformat(),
+        })
+    return result
 
 
 if __name__ == "__main__":

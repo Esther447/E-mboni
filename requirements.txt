@@ -1,10 +1,13 @@
 fastapi
 uvicorn
 python-multipart
-ultralytics
-opencv-python
+opencv-python-headless
 onnxruntime
 sqlalchemy
 bcrypt
 python-jose[cryptography]
 psycopg2-binary
+python-dotenv
+torch --index-url https://download.pytorch.org/whl/cpu
+timm
+ultralytics
