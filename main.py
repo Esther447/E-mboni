@@ -128,15 +128,22 @@ def _require_role(role: RoleEnum):
 # ---------------------------------------------------------------------------
 
 @app.post("/auth/register", response_model=RegisterResponse, status_code=201, tags=["Authentication"])
-def register(body: RegisterRequest, db: Session = Depends(get_db)):
+async def register(body: RegisterRequest, db: Session = Depends(get_db)):
+    import asyncio
+    from functools import partial
+
     for phone in [body.guardian.phone, body.blind_user.phone]:
         if db.query(User).filter(User.phone == phone).first():
             raise HTTPException(status_code=422, detail="Phone number already registered")
 
+    loop = asyncio.get_event_loop()
+    guardian_hash = await loop.run_in_executor(None, partial(hash_password, body.guardian.password))
+    blind_hash    = await loop.run_in_executor(None, partial(hash_password, body.blind_user.phone[-6:]))
+
     guardian = User(
         name=body.guardian.name,
         phone=body.guardian.phone,
-        password_hash=hash_password(body.guardian.password),
+        password_hash=guardian_hash,
         role=RoleEnum.guardian,
         relationship=body.guardian.relationship,
     )
@@ -146,7 +153,7 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
     blind_user = User(
         name=body.blind_user.name,
         phone=body.blind_user.phone,
-        password_hash=hash_password(body.blind_user.phone[-6:]),
+        password_hash=blind_hash,
         role=RoleEnum.blind,
         language=body.blind_user.language,
         voice_speed=body.blind_user.voice_speed,
@@ -358,7 +365,8 @@ async def detect(
     spatial_results = process_detections(raw_detections)
 
     # --- CONSISTENCY FILTER: only report objects seen 2+ frames in a row ---
-    _consistency.update([r.label for r in raw_detections])
+    _label_priorities = {s.object: s.priority for s in spatial_results}
+    _consistency.update([r.label for r in raw_detections], _label_priorities)
     raw_detections = [r for r in raw_detections if _consistency.is_confirmed(r.label)]
     spatial_results = [s for s in spatial_results if _consistency.is_confirmed(s.object)]
 
