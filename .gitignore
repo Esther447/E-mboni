@@ -21,3 +21,5 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+e-mboni-firebase-adminsdk-*.json
+*-firebase-adminsdk-*.json

@@ -154,6 +154,7 @@ class AlertOut(BaseModel):
     blind_id: int
     message: str
     level: str
+    is_read: bool = False
     created_at: datetime
 
     class Config:

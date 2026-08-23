@@ -1,20 +1,18 @@
 """
 main.py — E-mboni FastAPI Backend
+Database: Firebase Cloud Firestore (migrated from SQLAlchemy/PostgreSQL)
+All endpoints, response formats, and auth behavior preserved.
 """
 
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-from sqlalchemy.orm import Session
 from typing import Optional, List
 import cv2
 import numpy as np
 import uvicorn
 import logging
 
-# ---------------------------------------------------------------------------
-# Logging — shows every request in terminal during frontend testing
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -26,10 +24,9 @@ from ultralytics import YOLO
 
 from database import (
     init_db, get_db, verify_password, hash_password,
-    User, Alert, Session as NavSession,
     RoleEnum, AlertLevelEnum, SessionStatusEnum, LanguageEnum, VoiceSpeedEnum, StatusEnum,
 )
-from auth import create_token, decode_token
+from auth import create_token, decode_token, get_current_user_from_token
 from models import (
     RegisterRequest, RegisterResponse, UserOut, BlindUserOut,
     LoginRequest, LoginResponse, LoginUserOut, BlindUserSummary,
@@ -39,11 +36,12 @@ from models import (
 from spatial_engine import RawDetection, process_detections, ALL_OBJECTS
 from events import event_store
 from memory import CrowdDetector, ConsistencyFilter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
+import firestore_service as fs
 
-# One crowd detector and one consistency filter shared across all requests
 _crowd_detector = CrowdDetector()
-_consistency = ConsistencyFilter()
+_consistency    = ConsistencyFilter()
+
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -52,12 +50,9 @@ _consistency = ConsistencyFilter()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    logger.info("E-mboni backend started. Database ready.")
+    logger.info("E-mboni backend started. Firestore ready.")
     yield
 
-# ---------------------------------------------------------------------------
-# Swagger metadata — this is what the frontend team sees at /docs
-# ---------------------------------------------------------------------------
 app = FastAPI(
     title="E-mboni API",
     version="1.0.0",
@@ -104,23 +99,54 @@ general_model = YOLO("yolov8n.pt",   task="detect")
 # Auth helpers
 # ---------------------------------------------------------------------------
 
-def _require_auth(authorization: str = Header(...), db: Session = Depends(get_db)):
+def _require_auth(authorization: str = Header(...)):
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header.")
     token = authorization.split(" ", 1)[1]
-    payload = decode_token(token)
-    user = db.query(User).filter(User.id == int(payload["sub"])).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found.")
-    return user
+    return get_current_user_from_token(token)
 
 
 def _require_role(role: RoleEnum):
-    def checker(current_user: User = Depends(_require_auth)):
-        if current_user.role != role:
+    def checker(current_user: dict = Depends(_require_auth)):
+        if current_user["role"] != role.value:
             raise HTTPException(status_code=403, detail="Access denied.")
         return current_user
     return checker
+
+
+def _user_to_admin_out(u: dict) -> UserAdminOut:
+    return UserAdminOut(
+        id=u["id"],
+        name=u["name"],
+        phone=u["phone"],
+        role=u["role"],
+        language=u.get("language", "en"),
+        voice_speed=u.get("voice_speed", "Normal"),
+        status=u.get("status", "active"),
+        guardian_id=u.get("guardian_id"),
+        created_at=u["created_at"],
+    )
+
+
+def _alert_to_out(a: dict) -> AlertOut:
+    return AlertOut(
+        id=a["id"],
+        blind_id=a["blind_id"],
+        message=a["message"],
+        level=a["level"],
+        is_read=a.get("is_read", False),
+        created_at=a["created_at"],
+    )
+
+
+def _session_to_out(s: dict) -> SessionOut:
+    return SessionOut(
+        id=s["id"],
+        blind_id=s["blind_id"],
+        started_at=s["started_at"],
+        ended_at=s.get("ended_at"),
+        status=s["status"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -128,49 +154,43 @@ def _require_role(role: RoleEnum):
 # ---------------------------------------------------------------------------
 
 @app.post("/auth/register", response_model=RegisterResponse, status_code=201, tags=["Authentication"])
-async def register(body: RegisterRequest, db: Session = Depends(get_db)):
+async def register(body: RegisterRequest, db=Depends(get_db)):
     import asyncio
     from functools import partial
 
     for phone in [body.guardian.phone, body.blind_user.phone]:
-        if db.query(User).filter(User.phone == phone).first():
+        if fs.get_user_by_phone(phone):
             raise HTTPException(status_code=422, detail="Phone number already registered")
 
     loop = asyncio.get_event_loop()
     guardian_hash = await loop.run_in_executor(None, partial(hash_password, body.guardian.password))
     blind_hash    = await loop.run_in_executor(None, partial(hash_password, body.blind_user.phone[-6:]))
 
-    guardian = User(
+    guardian = fs.create_user(
         name=body.guardian.name,
         phone=body.guardian.phone,
         password_hash=guardian_hash,
-        role=RoleEnum.guardian,
+        role=RoleEnum.guardian.value,
         relationship=body.guardian.relationship,
     )
-    db.add(guardian)
-    db.flush()
 
-    blind_user = User(
+    blind_user = fs.create_user(
         name=body.blind_user.name,
         phone=body.blind_user.phone,
         password_hash=blind_hash,
-        role=RoleEnum.blind,
+        role=RoleEnum.blind.value,
         language=body.blind_user.language,
         voice_speed=body.blind_user.voice_speed,
-        emergency_phone=guardian.phone,
-        guardian_id=guardian.id,
+        emergency_phone=guardian["phone"],
+        guardian_id=guardian["id"],
     )
-    db.add(blind_user)
-    db.commit()
-    db.refresh(guardian)
-    db.refresh(blind_user)
 
-    logger.info(f"REGISTER | guardian={guardian.phone} blind={blind_user.phone}")
-    token = create_token(guardian.id, guardian.role.value)
+    logger.info(f"REGISTER | guardian={guardian['phone']} blind={blind_user['phone']}")
+    token = create_token(guardian["id"], guardian["role"])
     return RegisterResponse(
-        guardian=UserOut(id=guardian.id, name=guardian.name, phone=guardian.phone, role=guardian.role.value),
-        blind_user=BlindUserOut(id=blind_user.id, name=blind_user.name, phone=blind_user.phone,
-                                role=blind_user.role.value, guardian_id=guardian.id),
+        guardian=UserOut(id=guardian["id"], name=guardian["name"], phone=guardian["phone"], role=guardian["role"]),
+        blind_user=BlindUserOut(id=blind_user["id"], name=blind_user["name"], phone=blind_user["phone"],
+                                role=blind_user["role"], guardian_id=guardian["id"]),
         token=token,
     )
 
@@ -180,62 +200,59 @@ async def register(body: RegisterRequest, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @app.post("/auth/login", response_model=LoginResponse, tags=["Authentication"])
-def login(body: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.phone == body.phone).first()
-    if not user or not verify_password(body.password, user.password_hash):
+def login(body: LoginRequest, db=Depends(get_db)):
+    user = fs.get_user_by_phone(body.phone)
+    if not user or not verify_password(body.password, user["password_hash"]):
         logger.warning(f"LOGIN FAILED | phone={body.phone}")
         raise HTTPException(status_code=401, detail="Wrong phone or password.")
 
-    logger.info(f"LOGIN OK | phone={user.phone} role={user.role.value}")
+    logger.info(f"LOGIN OK | phone={user['phone']} role={user['role']}")
     blind_summary = None
-    if user.role == RoleEnum.guardian:
-        linked = db.query(User).filter(User.guardian_id == user.id).first()
-        if linked:
+    if user["role"] == RoleEnum.guardian.value:
+        linked_list = fs.get_blind_users_for_guardian(user["id"])
+        if linked_list:
+            linked = linked_list[0]
             blind_summary = BlindUserSummary(
-                id=linked.id,
-                name=linked.name,
-                status=linked.status.value,
-                language=linked.language.value,
+                id=linked["id"],
+                name=linked["name"],
+                status=linked.get("status", "active"),
+                language=linked.get("language", "en"),
             )
 
     return LoginResponse(
-        token=create_token(user.id, user.role.value),
+        token=create_token(user["id"], user["role"]),
         user=LoginUserOut(
-            id=user.id,
-            name=user.name,
-            role=user.role.value,
-            language=user.language.value,
-            voice_speed=user.voice_speed.value,
+            id=user["id"],
+            name=user["name"],
+            role=user["role"],
+            language=user.get("language", "en"),
+            voice_speed=user.get("voice_speed", "Normal"),
             blind_user=blind_summary,
         ),
     )
 
 
 # ---------------------------------------------------------------------------
-# POST /detect  — updated to frontend DetectionResult format
+# POST /detect
 # ---------------------------------------------------------------------------
 
 MOVING_OBJECTS = {
     "car", "truck", "bus", "motorcycle", "bicycle", "person",
     "dog", "cat", "vehicle", "van", "scooter", "animal",
 }
-
-HIGH_DANGER_OBJECTS  = {"car", "truck", "bus", "motorcycle", "vehicle", "van"}
+HIGH_DANGER_OBJECTS   = {"car", "truck", "bus", "motorcycle", "vehicle", "van"}
 MEDIUM_DANGER_OBJECTS = {
     "bicycle", "scooter", "person", "dog", "cat", "animal",
     "chair", "table", "bench", "pole", "fire hydrant", "trash can",
     "staircase", "stairs", "step",
 }
-
-# Objects that become DANGER at <= 1.5m regardless of category (safety brain rule)
 CRITICAL_CLOSE_OBJECTS = {"car", "stair", "truck", "bus", "motorcycle", "staircase", "stairs"}
-
 DIRECTION_MAP = {
-    "to your far left": "left",
-    "on your left":     "left",
-    "straight ahead":   "center",
-    "on your right":    "right",
-    "to your far right":"right",
+    "to your far left":  "left",
+    "on your left":      "left",
+    "straight ahead":    "center",
+    "on your right":     "right",
+    "to your far right": "right",
 }
 
 
@@ -250,7 +267,6 @@ def _norm_area_to_meters(norm_area: float) -> float:
 
 
 def _danger_level(name: str, distance: float) -> str:
-    # Safety brain rule: car or stair within 1.5m → always danger, save immediately
     if name in CRITICAL_CLOSE_OBJECTS and distance <= 1.5:
         return "danger"
     if name in HIGH_DANGER_OBJECTS:
@@ -263,12 +279,11 @@ def _danger_level(name: str, distance: float) -> str:
 
 
 def _map_direction(direction_str: str) -> str:
-    # direction_str may include vertical suffix like "on your left, low"
     base = direction_str.split(",")[0].strip()
     return DIRECTION_MAP.get(base, "center")
 
 
-def _build_summary(objects: list[DetectedObject]) -> str:
+def _build_summary(objects: list) -> str:
     if not objects:
         return "Path clear."
     top = objects[0]
@@ -276,70 +291,36 @@ def _build_summary(objects: list[DetectedObject]) -> str:
     return f"{moving}{top.name}, {top.distanceMeters:.1f} meters {'ahead' if top.direction == 'center' else top.direction}"
 
 
-def _save_alert(db: Session, blind_id: int, message: str, level: str):
-    """INSERT a danger or warning alert into the alerts table."""
-    db.add(Alert(
-        blind_id=blind_id,
-        message=message,
-        level=AlertLevelEnum(level),
-    ))
-    db.commit()
-
-
-def _last_alert_seconds_ago(db: Session, blind_id: int) -> float:
-    """
-    Returns how many seconds ago the last alert was saved for this blind user.
-    Returns 999 if no alerts exist yet (safe to announce path clear).
-    """
-    last = (
-        db.query(Alert)
-        .filter(Alert.blind_id == blind_id)
-        .order_by(Alert.created_at.desc())
-        .first()
-    )
-    if not last:
-        return 999.0
-    now = datetime.now(timezone.utc)
-    last_time = last.created_at
-    # Make timezone-aware if stored as naive UTC
-    if last_time.tzinfo is None:
-        last_time = last_time.replace(tzinfo=timezone.utc)
-    return (now - last_time).total_seconds()
-
-
-PATH_CLEAR_SILENCE_SECONDS = 5.0  # must be this long since last alert to say "Path clear"
+PATH_CLEAR_SILENCE_SECONDS = 5.0
 
 
 @app.post("/detect", response_model=DetectionResult, tags=["Detection"])
 async def detect(
     file: UploadFile = File(...),
     authorization: Optional[str] = Header(None),
-    db: Session = Depends(get_db),
+    db=Depends(get_db),
 ):
     contents = await file.read()
     if not contents:
         raise HTTPException(status_code=400, detail="Empty image file received.")
 
     nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
+    img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         raise HTTPException(status_code=400, detail="Could not decode image. Send a valid JPEG.")
 
     h, w = img.shape[:2]
 
-    # --- Identify the blind user from token (optional) ---
-    blind_user: Optional[User] = None
+    blind_user: Optional[dict] = None
     if authorization and authorization.startswith("Bearer "):
         try:
             payload = decode_token(authorization.split(" ", 1)[1])
-            u = db.query(User).filter(User.id == int(payload["sub"])).first()
-            if u and u.role == RoleEnum.blind:
+            u = fs.get_user_by_id(int(payload["sub"]))
+            if u and u["role"] == RoleEnum.blind.value:
                 blind_user = u
         except Exception:
             pass
 
-    # --- Run both YOLO models ---
     results_c = custom_model(img, conf=0.6)
     results_g = general_model(img, conf=0.6)
 
@@ -364,17 +345,13 @@ async def detect(
 
     spatial_results = process_detections(raw_detections)
 
-    # --- CONSISTENCY FILTER: only report objects seen 2+ frames in a row ---
     _label_priorities = {s.object: s.priority for s in spatial_results}
     _consistency.update([r.label for r in raw_detections], _label_priorities)
-    raw_detections = [r for r in raw_detections if _consistency.is_confirmed(r.label)]
-    spatial_results = [s for s in spatial_results if _consistency.is_confirmed(s.object)]
+    raw_detections   = [r for r in raw_detections if _consistency.is_confirmed(r.label)]
+    spatial_results  = [s for s in spatial_results if _consistency.is_confirmed(s.object)]
 
-    # --- Crowd detection check (runs before individual object logic) ---
     is_crowd, crowd_message = _crowd_detector.evaluate(raw_detections, spatial_results)
 
-    # --- Build frontend-format objects ---
-    # Use spatial_results (already filtered + sorted) and look up matching raw by label
     raw_by_label = {r.label: r for r in raw_detections}
     detected_objects: list[DetectedObject] = []
     for spatial in spatial_results:
@@ -382,7 +359,7 @@ async def detect(
         if not raw:
             continue
         norm_area = raw.box_area / (w * h)
-        dist_m = _norm_area_to_meters(norm_area)
+        dist_m    = _norm_area_to_meters(norm_area)
         direction = _map_direction(spatial.direction)
         detected_objects.append(DetectedObject(
             name=raw.label,
@@ -394,10 +371,8 @@ async def detect(
 
     danger_order = {"danger": 0, "warning": 1, "safe": 2}
     detected_objects.sort(key=lambda o: danger_order[o.dangerLevel])
-
     top_danger = detected_objects[0].dangerLevel if detected_objects else "safe"
 
-    # --- Save danger/warning alerts to DB ---
     if blind_user and detected_objects:
         top = detected_objects[0]
         if top.dangerLevel in ("danger", "warning"):
@@ -407,47 +382,51 @@ async def detect(
                 distance=str(top.distanceMeters),
             )
             top_spatial = next((s for s in spatial_results if s.object == top.name), None)
-            _save_alert(
-                db=db,
-                blind_id=blind_user.id,
+            fs.create_alert(
+                blind_id=blind_user["id"],
                 message=top_spatial.speech if top_spatial else top.name,
                 level=top.dangerLevel,
             )
 
-    # --- Build summary ---
-    # Crowd mode: collapse individual person alerts into one crowd message
     if is_crowd and crowd_message:
         summary = crowd_message
     elif not detected_objects:
-        # Path clear: only announce if DB confirms silence for 5+ seconds
         if blind_user:
-            seconds_ago = _last_alert_seconds_ago(db, blind_user.id)
-            summary = "Path clear." if seconds_ago >= PATH_CLEAR_SILENCE_SECONDS else ""
+            last = fs.get_last_alert_for_blind(blind_user["id"])
+            if last:
+                now = datetime.now(timezone.utc)
+                last_time = last["created_at"]
+                if last_time.tzinfo is None:
+                    last_time = last_time.replace(tzinfo=timezone.utc)
+                seconds_ago = (now - last_time).total_seconds()
+                summary = "Path clear." if seconds_ago >= PATH_CLEAR_SILENCE_SECONDS else ""
+            else:
+                summary = "Path clear."
         else:
             summary = "Path clear."
     else:
         summary = _build_summary(detected_objects)
 
-    logger.info(f"DETECT | user={blind_user.phone if blind_user else 'anonymous'} | topDanger={top_danger} | objects={len(detected_objects)}")
+    logger.info(f"DETECT | user={blind_user['phone'] if blind_user else 'anonymous'} | topDanger={top_danger} | objects={len(detected_objects)}")
     return DetectionResult(objects=detected_objects, summary=summary, topDanger=top_danger)
 
 
 # ---------------------------------------------------------------------------
-# GET /auth/me  — current logged-in user profile
+# GET /auth/me
 # ---------------------------------------------------------------------------
 
 @app.get("/auth/me", tags=["Authentication"])
-def get_me(current_user: User = Depends(_require_auth)):
+def get_me(current_user: dict = Depends(_require_auth)):
     return {
-        "id":              current_user.id,
-        "name":            current_user.name,
-        "phone":           current_user.phone,
-        "role":            current_user.role.value,
-        "language":        current_user.language.value,
-        "voice_speed":     current_user.voice_speed.value,
-        "status":          current_user.status.value,
-        "emergency_phone": current_user.emergency_phone,
-        "guardian_id":     current_user.guardian_id,
+        "id":              current_user["id"],
+        "name":            current_user["name"],
+        "phone":           current_user["phone"],
+        "role":            current_user["role"],
+        "language":        current_user.get("language", "en"),
+        "voice_speed":     current_user.get("voice_speed", "Normal"),
+        "status":          current_user.get("status", "active"),
+        "emergency_phone": current_user.get("emergency_phone"),
+        "guardian_id":     current_user.get("guardian_id"),
     }
 
 
@@ -456,60 +435,47 @@ def get_me(current_user: User = Depends(_require_auth)):
 # ---------------------------------------------------------------------------
 
 @app.get("/users", response_model=List[UserAdminOut], tags=["Admin"])
-def list_users(
-    current_user: User = Depends(_require_role(RoleEnum.admin)),
-    db: Session = Depends(get_db),
-):
-    return db.query(User).all()
+def list_users(current_user: dict = Depends(_require_role(RoleEnum.admin)), db=Depends(get_db)):
+    return [_user_to_admin_out(u) for u in fs.get_all_users()]
 
 
 @app.get("/users/{user_id}", response_model=UserAdminOut, tags=["Admin"])
-def get_user(
-    user_id: int,
-    current_user: User = Depends(_require_role(RoleEnum.admin)),
-    db: Session = Depends(get_db),
-):
-    user = db.query(User).filter(User.id == user_id).first()
+def get_user(user_id: int, current_user: dict = Depends(_require_role(RoleEnum.admin)), db=Depends(get_db)):
+    user = fs.get_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
-    return user
+    return _user_to_admin_out(user)
 
 
 @app.patch("/users/{user_id}/status", tags=["Admin"])
 def update_user_status(
     user_id: int,
     status: str,
-    current_user: User = Depends(_require_role(RoleEnum.admin)),
-    db: Session = Depends(get_db),
+    current_user: dict = Depends(_require_role(RoleEnum.admin)),
+    db=Depends(get_db),
 ):
-    user = db.query(User).filter(User.id == user_id).first()
+    if status not in [s.value for s in StatusEnum]:
+        raise HTTPException(status_code=422, detail="Invalid status value.")
+    user = fs.update_user_status(user_id, status)
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
-    try:
-        user.status = StatusEnum(status)
-    except ValueError:
-        raise HTTPException(status_code=422, detail="Invalid status value.")
-    db.commit()
-    return {"id": user_id, "status": user.status.value}
+    return {"id": user_id, "status": status}
 
 
 # ---------------------------------------------------------------------------
-# /alerts/*  — guardian alert feed
+# /alerts/*
 # ---------------------------------------------------------------------------
 
 @app.get("/alerts", response_model=List[AlertOut], tags=["Alerts"])
-def get_alerts(
-    current_user: User = Depends(_require_auth),
-    db: Session = Depends(get_db),
-):
-    if current_user.role == RoleEnum.guardian:
-        blind = db.query(User).filter(User.guardian_id == current_user.id).first()
-        if not blind:
+def get_alerts(current_user: dict = Depends(_require_auth), db=Depends(get_db)):
+    if current_user["role"] == RoleEnum.guardian.value:
+        blind_list = fs.get_blind_users_for_guardian(current_user["id"])
+        if not blind_list:
             return []
-        return db.query(Alert).filter(Alert.blind_id == blind.id).order_by(Alert.created_at.desc()).limit(50).all()
+        return [_alert_to_out(a) for a in fs.get_alerts_for_blind(blind_list[0]["id"], limit=50)]
 
-    if current_user.role == RoleEnum.admin:
-        return db.query(Alert).order_by(Alert.created_at.desc()).limit(100).all()
+    if current_user["role"] == RoleEnum.admin.value:
+        return [_alert_to_out(a) for a in fs.get_all_alerts(limit=100)]
 
     raise HTTPException(status_code=403, detail="Access denied.")
 
@@ -517,127 +483,231 @@ def get_alerts(
 @app.get("/alerts/{blind_id}", response_model=List[AlertOut], tags=["Alerts"])
 def get_alerts_for_blind(
     blind_id: int,
-    current_user: User = Depends(_require_role(RoleEnum.admin)),
-    db: Session = Depends(get_db),
+    current_user: dict = Depends(_require_role(RoleEnum.admin)),
+    db=Depends(get_db),
 ):
-    return db.query(Alert).filter(Alert.blind_id == blind_id).order_by(Alert.created_at.desc()).all()
+    return [_alert_to_out(a) for a in fs.get_alerts_for_blind(blind_id)]
 
 
 # ---------------------------------------------------------------------------
-# /guardian/*  — guardian dashboard
+# /guardian/*
 # ---------------------------------------------------------------------------
 
 @app.get("/guardian/dashboard", response_model=GuardianDashboardOut, tags=["Guardian"])
-def guardian_dashboard(
-    current_user: User = Depends(_require_role(RoleEnum.guardian)),
-    db: Session = Depends(get_db),
-):
-    # Find the blind user linked to this guardian
-    blind = db.query(User).filter(User.guardian_id == current_user.id).first()
-    recent_alerts = []
+def guardian_dashboard(current_user: dict = Depends(_require_role(RoleEnum.guardian)), db=Depends(get_db)):
+    blind_list     = fs.get_blind_users_for_guardian(current_user["id"])
+    blind          = blind_list[0] if blind_list else None
+    recent_alerts  = []
     active_session = None
 
     if blind:
-        # Exact query from spec:
-        # SELECT * FROM alerts
-        # WHERE blind_id IN (SELECT id FROM users WHERE guardian_id = current_guardian_id)
-        # ORDER BY created_at DESC LIMIT 10
-        blind_ids = [
-            row.id for row in
-            db.query(User.id).filter(User.guardian_id == current_user.id).all()
-        ]
-        recent_alerts = (
-            db.query(Alert)
-            .filter(Alert.blind_id.in_(blind_ids))
-            .order_by(Alert.created_at.desc())
-            .limit(10)
-            .all()
-        )
-        active_session = (
-            db.query(NavSession)
-            .filter(
-                NavSession.blind_id == blind.id,
-                NavSession.status == SessionStatusEnum.active,
-            )
-            .first()
-        )
+        blind_ids     = [u["id"] for u in blind_list]
+        recent_alerts = [_alert_to_out(a) for a in fs.get_alerts_for_blind_ids(blind_ids, limit=10)]
+        sess          = fs.get_active_session(blind["id"])
+        active_session = _session_to_out(sess) if sess else None
 
     return GuardianDashboardOut(
-        guardian=current_user,
-        blind_user=blind,
+        guardian=_user_to_admin_out(current_user),
+        blind_user=_user_to_admin_out(blind) if blind else None,
         recent_alerts=recent_alerts,
         active_session=active_session,
     )
 
 
+@app.get("/guardian/tracking", tags=["Guardian"])
+def guardian_tracking(current_user: dict = Depends(_require_role(RoleEnum.guardian)), db=Depends(get_db)):
+    blind_list = fs.get_blind_users_for_guardian(current_user["id"])
+    if not blind_list:
+        return {"timeline": [], "session": {"status": "No blind user", "duration_minutes": 0, "alert_count": 0}, "blind_name": ""}
+
+    blind  = blind_list[0]
+    alerts = fs.get_alerts_for_blind(blind["id"], limit=20)
+    sess   = fs.get_active_session(blind["id"])
+
+    duration = 0
+    if sess:
+        now     = datetime.now(timezone.utc)
+        started = sess["started_at"]
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        duration = int((now - started).total_seconds() / 60)
+
+    top_level = "Safe"
+    if alerts:
+        if alerts[0]["level"] == "danger":
+            top_level = "Danger"
+        elif alerts[0]["level"] == "warning":
+            top_level = "Warning"
+
+    timeline = [
+        {"time": a["created_at"].strftime("%H:%M"), "event": a["message"], "level": a["level"]}
+        for a in alerts
+    ]
+
+    return {
+        "blind_name":  blind["name"],
+        "blind_phone": blind["phone"],
+        "is_scanning": sess is not None,
+        "timeline":    timeline,
+        "session": {
+            "status":           top_level,
+            "duration_minutes": duration,
+            "alert_count":      len(alerts),
+        },
+    }
+
+
+@app.get("/guardian/alerts", response_model=List[AlertOut], tags=["Guardian"])
+def guardian_alerts(current_user: dict = Depends(_require_role(RoleEnum.guardian)), db=Depends(get_db)):
+    blind_list = fs.get_blind_users_for_guardian(current_user["id"])
+    if not blind_list:
+        return []
+    return [_alert_to_out(a) for a in fs.get_alerts_for_blind(blind_list[0]["id"], limit=50)]
+
+
+@app.get("/guardian/emergency", tags=["Guardian"])
+def guardian_emergency_get(current_user: dict = Depends(_require_role(RoleEnum.guardian)), db=Depends(get_db)):
+    blind_list = fs.get_blind_users_for_guardian(current_user["id"])
+    if not blind_list:
+        raise HTTPException(status_code=404, detail="No blind user linked.")
+    blind = blind_list[0]
+    return {
+        "blind_name":      blind["name"],
+        "emergency_phone": blind.get("emergency_phone"),
+        "guardian_phone":  current_user["phone"],
+    }
+
+
+@app.post("/guardian/emergency", tags=["Guardian"])
+def guardian_emergency_post(current_user: dict = Depends(_require_role(RoleEnum.guardian)), db=Depends(get_db)):
+    """Trigger emergency — returns blind user contact info for the Flutter app to initiate a call."""
+    blind_list = fs.get_blind_users_for_guardian(current_user["id"])
+    if not blind_list:
+        raise HTTPException(status_code=404, detail="No blind user linked.")
+    blind = blind_list[0]
+    logger.info(f"EMERGENCY | guardian={current_user['phone']} blind={blind['phone']}")
+    return {
+        "blind_name":      blind["name"],
+        "emergency_phone": blind.get("emergency_phone"),
+        "guardian_phone":  current_user["phone"],
+        "triggered":       True,
+    }
+
+
+@app.post("/guardian/alerts/{alert_id}/read", tags=["Guardian"])
+def mark_alert_read(
+    alert_id: int,
+    current_user: dict = Depends(_require_role(RoleEnum.guardian)),
+    db=Depends(get_db),
+):
+    """Mark an alert as read. Guardian can only mark alerts belonging to their blind user."""
+    alert = fs.get_alert_by_id(alert_id)
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found.")
+    # Verify the alert belongs to this guardian's blind user
+    blind_list = fs.get_blind_users_for_guardian(current_user["id"])
+    blind_ids  = [u["id"] for u in blind_list]
+    if alert["blind_id"] not in blind_ids:
+        raise HTTPException(status_code=403, detail="Access denied.")
+    updated = fs.mark_alert_read(alert_id)
+    return _alert_to_out(updated)
+
+
 # ---------------------------------------------------------------------------
-# /session/*  — blind user navigation sessions
+# /session/*
 # ---------------------------------------------------------------------------
 
 @app.post("/session/start", response_model=SessionOut, status_code=201, tags=["Sessions"])
-def start_session(
-    current_user: User = Depends(_require_role(RoleEnum.blind)),
-    db: Session = Depends(get_db),
-):
-    # End any existing active session first
-    existing = db.query(NavSession).filter(
-        NavSession.blind_id == current_user.id,
-        NavSession.status == SessionStatusEnum.active,
-    ).first()
-    if existing:
-        from datetime import datetime
-        existing.status = SessionStatusEnum.ended
-        existing.ended_at = datetime.utcnow()
-
-    session = NavSession(blind_id=current_user.id)
-    db.add(session)
-    db.commit()
-    db.refresh(session)
-    return session
+def start_session(current_user: dict = Depends(_require_role(RoleEnum.blind)), db=Depends(get_db)):
+    sess = fs.start_session(current_user["id"])
+    return _session_to_out(sess)
 
 
 @app.post("/session/end", response_model=SessionOut, tags=["Sessions"])
-def end_session(
-    current_user: User = Depends(_require_role(RoleEnum.blind)),
-    db: Session = Depends(get_db),
-):
-    from datetime import datetime
-    session = db.query(NavSession).filter(
-        NavSession.blind_id == current_user.id,
-        NavSession.status == SessionStatusEnum.active,
-    ).first()
-    if not session:
+def end_session(current_user: dict = Depends(_require_role(RoleEnum.blind)), db=Depends(get_db)):
+    sess = fs.end_session(current_user["id"])
+    if not sess:
         raise HTTPException(status_code=404, detail="No active session found.")
-    session.status = SessionStatusEnum.ended
-    session.ended_at = datetime.utcnow()
-    db.commit()
-    db.refresh(session)
-    return session
+    return _session_to_out(sess)
 
 
 @app.get("/session/active", response_model=Optional[SessionOut], tags=["Sessions"])
-def get_active_session(
-    current_user: User = Depends(_require_auth),
-    db: Session = Depends(get_db),
-):
-    blind_id = current_user.id if current_user.role == RoleEnum.blind else None
-    if current_user.role == RoleEnum.guardian:
-        blind = db.query(User).filter(User.guardian_id == current_user.id).first()
-        blind_id = blind.id if blind else None
+def get_active_session(current_user: dict = Depends(_require_auth), db=Depends(get_db)):
+    blind_id = None
+    if current_user["role"] == RoleEnum.blind.value:
+        blind_id = current_user["id"]
+    elif current_user["role"] == RoleEnum.guardian.value:
+        blind_list = fs.get_blind_users_for_guardian(current_user["id"])
+        blind_id   = blind_list[0]["id"] if blind_list else None
     if not blind_id:
         return None
-    return db.query(NavSession).filter(
-        NavSession.blind_id == blind_id,
-        NavSession.status == SessionStatusEnum.active,
-    ).first()
+    sess = fs.get_active_session(blind_id)
+    return _session_to_out(sess) if sess else None
 
 
 @app.get("/session/history", response_model=List[SessionOut], tags=["Sessions"])
-def session_history(
-    current_user: User = Depends(_require_role(RoleEnum.admin)),
-    db: Session = Depends(get_db),
-):
-    return db.query(NavSession).order_by(NavSession.started_at.desc()).limit(100).all()
+def session_history(current_user: dict = Depends(_require_role(RoleEnum.admin)), db=Depends(get_db)):
+    return [_session_to_out(s) for s in fs.get_all_sessions(limit=100)]
+
+
+# ---------------------------------------------------------------------------
+# /admin/*
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/overview", tags=["Admin"])
+def admin_overview(current_user: dict = Depends(_require_role(RoleEnum.admin)), db=Depends(get_db)):
+    all_users       = fs.get_all_users()
+    total_users     = len(all_users)
+    total_guardians = sum(1 for u in all_users if u["role"] == RoleEnum.guardian.value)
+
+    active_blind_ids = fs.get_active_session_ids()
+    active_now       = len(active_blind_ids)
+
+    today_start  = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
+    alerts_today = fs.count_alerts_since(today_start)
+
+    active_users = []
+    for blind_id in active_blind_ids:
+        u = fs.get_user_by_id(blind_id)
+        if u:
+            active_users.append({"id": u["id"], "name": u["name"], "status": "Scanning"})
+
+    recent_alerts_raw = fs.get_alerts_with_user(limit=10)
+    recent_alerts = [
+        {
+            "id":         a["id"],
+            "user_name":  a.get("user_name", "Unknown"),
+            "message":    a["message"],
+            "level":      a["level"],
+            "created_at": a["created_at"].isoformat(),
+        }
+        for a in recent_alerts_raw
+    ]
+
+    return {
+        "total_users":     total_users,
+        "total_guardians": total_guardians,
+        "active_now":      active_now,
+        "alerts_today":    alerts_today,
+        "active_users":    active_users,
+        "recent_alerts":   recent_alerts,
+    }
+
+
+@app.get("/admin/logs", tags=["Admin"])
+def admin_logs(current_user: dict = Depends(_require_role(RoleEnum.admin)), db=Depends(get_db)):
+    rows = fs.get_alerts_with_user(limit=200)
+    return [
+        {
+            "id":         a["id"],
+            "blind_id":   a["blind_id"],
+            "user_name":  a.get("user_name", "Unknown"),
+            "message":    a["message"],
+            "level":      a["level"],
+            "created_at": a["created_at"].isoformat(),
+        }
+        for a in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -665,70 +735,6 @@ async def device_status(device_id: str):
 async def device_ping(device_id: str):
     event_store.ping(device_id)
     return {"status": "ok"}
-
-
-# ---------------------------------------------------------------------------
-# /guardian/tracking  — real timeline + session stats
-# ---------------------------------------------------------------------------
-
-@app.get("/guardian/tracking", tags=["Guardian"])
-def guardian_tracking(
-    current_user: User = Depends(_require_role(RoleEnum.guardian)),
-    db: Session = Depends(get_db),
-):
-    blind = db.query(User).filter(User.guardian_id == current_user.id).first()
-    if not blind:
-        return {"timeline": [], "session": {"status": "No blind user", "duration_minutes": 0, "alert_count": 0}, "blind_name": ""}
-
-    alerts = (
-        db.query(Alert)
-        .filter(Alert.blind_id == blind.id)
-        .order_by(Alert.created_at.desc())
-        .limit(20)
-        .all()
-    )
-
-    active_session = (
-        db.query(NavSession)
-        .filter(NavSession.blind_id == blind.id, NavSession.status == SessionStatusEnum.active)
-        .first()
-    )
-
-    duration = 0
-    if active_session:
-        now = datetime.now(timezone.utc)
-        started = active_session.started_at
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-        duration = int((now - started).total_seconds() / 60)
-
-    top_level = "Safe"
-    if alerts:
-        if alerts[0].level.value == "danger":
-            top_level = "Danger"
-        elif alerts[0].level.value == "warning":
-            top_level = "Warning"
-
-    timeline = [
-        {
-            "time": a.created_at.strftime("%H:%M"),
-            "event": a.message,
-            "level": a.level.value,
-        }
-        for a in alerts
-    ]
-
-    return {
-        "blind_name": blind.name,
-        "blind_phone": blind.phone,
-        "is_scanning": active_session is not None,
-        "timeline": timeline,
-        "session": {
-            "status": top_level,
-            "duration_minutes": duration,
-            "alert_count": len(alerts),
-        },
-    }
 
 
 if __name__ == "__main__":

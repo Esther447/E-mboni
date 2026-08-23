@@ -35,27 +35,30 @@ def speak(text):
 _alert_cooldown: dict[str, float] = {}  # prevent duplicate DB writes
 
 def post_alert(object_name: str, message: str, level: str, blind_id: int = 3):
-    """Insert a danger alert into PostgreSQL in a background thread."""
+    """Save a danger alert to Firestore in a background thread."""
     now = time.time()
     key = f"{object_name}_{level}"
-    # Only write once every 5 seconds per object+level to avoid DB spam
+
+    # Prevent duplicate alerts every 5 seconds
     if key in _alert_cooldown and (now - _alert_cooldown[key]) < 5.0:
         return
+
     _alert_cooldown[key] = now
 
     def _write():
         try:
-            from database import SessionLocal, Alert, AlertLevelEnum
-            db = SessionLocal()
-            db.add(Alert(
+            import firestore_service as fs
+
+            fs.create_alert(
                 blind_id=blind_id,
                 message=message,
-                level=AlertLevelEnum(level),
-            ))
-            db.commit()
-            db.close()
+                level=level,
+            )
+
+            print(f"🔥 Firestore alert saved: {message}")
+
         except Exception as e:
-            print(f"[alert DB error] {e}")
+            print(f"[Firestore alert error] {e}")
 
     threading.Thread(target=_write, daemon=True).start()
 

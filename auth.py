@@ -1,20 +1,17 @@
 """
 auth.py — JWT token creation and verification.
+Preserved: bcrypt password hashing, JWT tokens, Bearer auth.
+Changed: user lookup now uses Firestore via firestore_service.
 """
 
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from fastapi import HTTPException, Header
-from sqlalchemy.orm import Session
-from database import User, get_db
 import os
 import secrets
 
-# Load secret from environment variable.
-# If not set, generate a random one for this session (safe for dev).
-# In production: set SECRET_KEY in your environment before starting the server.
-SECRET_KEY = os.getenv("EMBONI_SECRET_KEY", secrets.token_hex(32))
-ALGORITHM  = "HS256"
+SECRET_KEY        = os.getenv("EMBONI_SECRET_KEY", secrets.token_hex(32))
+ALGORITHM         = "HS256"
 TOKEN_EXPIRE_DAYS = 30
 
 
@@ -34,12 +31,11 @@ def decode_token(token: str) -> dict:
         raise HTTPException(status_code=401, detail="Invalid or expired token.")
 
 
-def get_current_user(authorization: str = Header(...), db: Session = next(get_db())):
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header.")
-    token = authorization.split(" ", 1)[1]
+def get_current_user_from_token(token: str) -> dict:
+    """Decode token and fetch user from Firestore. Returns user dict."""
+    from firestore_service import get_user_by_id
     payload = decode_token(token)
-    user = db.query(User).filter(User.id == int(payload["sub"])).first()
+    user = get_user_by_id(int(payload["sub"]))
     if not user:
         raise HTTPException(status_code=401, detail="User not found.")
     return user
